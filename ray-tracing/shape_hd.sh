@@ -31,6 +31,7 @@ echo "centre distance $D"
 if [ "$(py -3 -c "print(1 if 0 < float('${D:-0}') < 400 else 0)")" != 1 ]; then echo "nothing near the centre of the view: no shots"; exit 1; fi
 py -3 rt.py freecam move 0 0 "$(py -3 -c "print(float('$D') - $DIST)")" | tail -1
 py -3 rt.py freecam turn "$YAW" 0 | tail -1
+[ "${LIVE:-0}" = 1 ] && { py -3 rt.py key esc; sleep 3; }      # LIVE=1: shoot with the match running (worms move)
 py -3 ab_setting.py ${NAME} ${SET:-round} ${A:-0} ${B:-1} "${LA:-stock mesh}" "${LB:-rounded}" | tail -1
 # PLAY=1: then let the match run and log the rounding's CPU cost and the tracer's with the
 # setting at B, then at A (about 12 s each; the harness logs "round:" every 300 frames)

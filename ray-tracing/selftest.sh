@@ -17,12 +17,15 @@ py -3 rt.py verify 2000
 py -3 rt.py rtstat 2 | sed -n 1,5p
 py -3 rt.py key esc; sleep 2
 py -3 rt.py rt on 1 0.5 0 >/dev/null; py -3 rt.py sky 0; sleep 1
-# The CPU reference uses flat triangle normals: compare with smooth normals off, then put the setting back.
+# The CPU reference uses flat triangle normals and has no cloud shadows: compare with smooth normals
+# and cloud shadows off, then put the settings back.
 INI=../../rt-sandbox/wumrt.ini
 SMOOTH=$(sed -n 's/^smooth = //p' $INI)
-sed -i 's/^smooth = .*/smooth = 0/' $INI; sleep 3
+CLOUDS=$(sed -n 's/^cloud_shadows = //p' $INI)
+sed -i 's/^smooth = .*/smooth = 0/; s/^cloud_shadows = .*/cloud_shadows = 0/' $INI; sleep 3
 py -3 compare_mask.py out/selftest | head -3
 [ -n "$SMOOTH" ] && sed -i "s/^smooth = .*/smooth = $SMOOTH/" $INI
+[ -n "$CLOUDS" ] && sed -i "s/^cloud_shadows = .*/cloud_shadows = $CLOUDS/" $INI
 echo "errors in the harness log: $(grep -c -i -E 'rt:.*(fail|not found|not available)|differs from the real' ../../rt-sandbox/wumrt.log)"
 echo "stack overflow fallbacks: $(grep -c 'overflowed the traversal' ../../rt-sandbox/wumrt.log)"
 py -3 sandbox.py stop

@@ -23,6 +23,7 @@ void post_reload(void);                         /* rt.py reload: compile wumrt_p
 /* Depth of field focuses on the worm nearest the middle of the main view: wumrt.c reports the
    centre of every worm draw (world space) with the camera it is drawn with. */
 int post_wants_worms(void);
+int post_main_view(void);                       /* motion-blur stream: draws go into the main view now */
 void post_note_worm(const float *centre, const float *view, const float *proj);
 /* grade.c: wumrt.c reports every landscape draw's texture hash (rt_terrain_hash) so the level
    is recognised for its own grade (wumrt_grades.ini). */

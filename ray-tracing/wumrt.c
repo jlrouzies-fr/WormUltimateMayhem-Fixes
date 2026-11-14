@@ -1323,6 +1323,12 @@ static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum ityp
             return;
         }
         if (lit && kind <= 2) rt_on_main_alpha(&d);
+        if (lit && kind <= 2 && vp && (vp->have & 7) == 7 && !vp->landscape && motion_objects_wanted()
+            && motion_object_begin(&d, vp->model, vp->view, vp->proj)) {    /* motion-blur stream: a moving object's */
+            if (kind == 1) real_glDrawArrays(mode, (GLint)first, (GLsizei)count);      /* screen velocity (motion.c) */
+            else real_glDrawElements(mode, (GLsizei)count, itype, indices);
+            motion_object_end();
+        }
         if (lit && kind <= 2 && vp->landscape) { scat_draw = d; scat_ok = 1; }
         /* The terrain's shader is only ever given the sun's colours. */
         if (lit && vp->landscape && fp && (fp->have & 0x180) == 0x180) {
@@ -1888,7 +1894,7 @@ static void read_settings(void)
     int gi = 0, refl = 0, denoise = 3, spec = 0, gi_rate = 1;
     float cl_strength = 0, cl_scale = 160.0f, cl_speed = 6.0f;      /* moss: cloud shadows */
     float gi_far = 0.0f;
-    float spec_strength = 1.0f, bump = 0.0f;
+    float spec_strength = 1.0f, bump = 0.0f, clearcoat = 0.0f;
     int smooth = 1, shells = 0, ftimer = 0, hud = 0;
     float wstyle = 0;
     float sh_height = 3.5f, sh_density = 0.3f, sh_width = 0.45f;
@@ -1941,6 +1947,7 @@ static void read_settings(void)
         else if (!strcmp(name, "denoise")) denoise = (int)v;
         else if (!strcmp(name, "specular")) spec = v != 0;
         else if (!strcmp(name, "specular_strength")) spec_strength = v;
+        else if (!strcmp(name, "clearcoat")) clearcoat = v;
         else if (!strcmp(name, "bump")) bump = v;
         else if (!strcmp(name, "smooth")) smooth = v != 0;
         else if (!strcmp(name, "shells")) shells = (int)v;
@@ -1993,6 +2000,7 @@ static void read_settings(void)
     rt_set_reflections(refl, refl_strength);
     rt_set_denoise(denoise);
     rt_set_specular(spec, spec_strength);
+    rt_set_clearcoat(clearcoat);
     bump_strength = bump;
     smooth_on = smooth;
     shell_count = shells < 0 ? 0 : shells;

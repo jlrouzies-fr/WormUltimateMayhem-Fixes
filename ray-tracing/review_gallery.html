@@ -17,6 +17,7 @@
   --stock: #8fa3b8;
   --baseline: #c9a36b;
   --current: #7fc8a0;
+  --late: #d98cb3;
   --display: "Barlow Condensed", "Arial Narrow", sans-serif;
   --body: "Inter", "Segoe UI", system-ui, sans-serif;
   --mono: "JetBrains Mono", Consolas, monospace;
@@ -35,6 +36,11 @@ h1 span { color: var(--accent); }
 .tabs button:focus-visible, .frame:focus-visible, .viewer button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .meta { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 16px 0 8px; color: var(--muted); font-size: 13px; }
 .meta b { color: var(--text); font-weight: 500; }
+.cols { flex-basis: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 4px; }
+.col { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; }
+.col h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.col h3 i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.col p { margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--muted); }
 .notes { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; margin: 8px 0 0; white-space: pre-wrap; font: 12px/1.6 var(--mono); color: var(--muted); max-width: 100%; overflow-x: auto; }
 section.level { margin-top: 36px; }
 section.level h2 { font: 600 24px/1.1 var(--display); letter-spacing: .03em; margin: 0 0 4px; }
@@ -48,6 +54,7 @@ section.level h2 small { font: 400 13px var(--body); color: var(--muted); letter
 .empty { color: var(--muted); padding: 40px 0; }
 .viewer { position: fixed; inset: 0; background: rgba(8, 9, 10, .96); display: flex; flex-direction: column; z-index: 20;
   padding: calc(12px + env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) calc(12px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px)); }
+.viewer[hidden] { display: none; }
 .viewer .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .viewer .title { font: 600 18px var(--display); letter-spacing: .03em; margin-right: auto; }
 .viewer button { font: 500 13px var(--body); color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 6px 12px; cursor: pointer; }
@@ -85,8 +92,8 @@ section.level h2 small { font: 400 13px var(--body); color: var(--muted); letter
 </div>
 
 <script>
-const PRESET_LABEL = { stock: "Stock game", baseline: "Baseline: main before the streams", current: "Current main" };
-const PRESET_COLOR = { stock: "var(--stock)", baseline: "var(--baseline)", current: "var(--current)" };
+const PRESET_LABEL = { stock: "Stock game", baseline: "Baseline: main before the streams", current: "Current main", late: "Late additions" };
+const PRESET_COLOR = { stock: "var(--stock)", baseline: "var(--baseline)", current: "var(--current)", late: "var(--late)" };
 let data = null, ms = null, viewer = null;
 
 function el(tag, attrs = {}, ...kids) {
@@ -109,6 +116,9 @@ function render() {
   tabs.replaceChildren(...data.milestones.map(m => el("button", { "aria-pressed": String(m === ms), onclick: () => { location.hash = m.id; } }, m.label)));
   const meta = document.getElementById("meta");
   meta.replaceChildren(el("span", {}, "Shot ", el("b", {}, ms.time)), el("span", {}, "Resolution ", el("b", {}, ms.res || "?")), el("span", {}, "Presets ", el("b", {}, ms.presets.map(p => PRESET_LABEL[p] || p).join(" | "))));
+  if (ms.columns) meta.append(el("div", { class: "cols" }, ...ms.presets.filter(p => ms.columns[p]).map(p =>
+    el("div", { class: "col" }, el("h3", {}, el("i", { style: `background:${PRESET_COLOR[p] || "var(--muted)"}` }), PRESET_LABEL[p] || p),
+      el("p", {}, ms.columns[p])))));
   if (ms.notes) meta.append(el("div", { class: "notes", style: "flex-basis:100%" }, ms.notes));
   const root = document.getElementById("levels");
   root.replaceChildren(...ms.levels.map(lv => el("section", { class: "level" },

@@ -34,7 +34,7 @@ EXE = SANDBOX / "WormsMayhem.exe"
 # WormsXHD itself: rt-sandbox's parent, or streams/NAME/rt-sandbox's grandparent's parent.
 ROOT = (SANDBOX.parent.parent.parent if SANDBOX.parent.parent.name.lower() == "streams" else SANDBOX.parent).resolve()
 REAL_GAME = ROOT / "WormsMayhem.exe"
-MAX_GAMES = int(os.environ.get("WUMRT_MAX_GAMES", "3"))   # user 15:38: parallel again
+MAX_GAMES = int(os.environ.get("WUMRT_MAX_GAMES", "16"))  # user 18:25: every session may run its game for 35 min (was 3)
 SLOT_ENFORCED = os.environ.get("WUMRT_SLOT", "0") == "1"    # the one-slot rule is off since 15:38
 START_LOCK = ROOT / ".wumrt_start.lock"     # held while one start checks the count and launches
 SLOT_FILE = ROOT / ".wumrt_slot"            # the one game slot: owner, expiry, hand-over, queue

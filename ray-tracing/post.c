@@ -225,6 +225,7 @@ static struct {
     int worm_found; float worm_dist, worm_score;   /* the worm nearest the middle of the main view */
     float night; float light_col[3]; int light_known;   /* level mood from the game's sun colour */
     int sun_on; float sun_uv[2], sun_col[3];   /* the sun on screen this frame, for the glare */
+    GLuint lit_tex; u32 lit_redirects;   /* (motion-blur stream) the texture the lit scene went into, see find_lit_texture */
 } F;
 
 static char *read_text(const char *path)
@@ -377,18 +378,19 @@ static void query_texture(struct scene_tex *t)
 }
 
 /* The colour texture of the engine's framebuffer that is bound now, its size and format. */
-static int find_scene_texture(void)
+static int find_scene_texture_as(GLuint want)
 {
-    GLint type = 0, name = 0;
+    GLint type = 0, name = (GLint)want;
     struct scene_tex *t = NULL;
     int i;
-    pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (want) type = GL_TEXTURE;
+    else pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
     if (type != GL_TEXTURE) {
         static u32 logged;
         if (!logged++) rt_log("post: the scene framebuffer has no colour texture (type %#x)", type);
         return 0;
     }
-    pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+    if (!want) pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
     if (name <= 0) return 0;
     for (i = 0; i < NST; i++) if (ST[i].id == (GLuint)name) { t = &ST[i]; break; }
     if (!t) {                       /* new: take the slot used longest ago */
@@ -402,6 +404,26 @@ static int find_scene_texture(void)
     t->used = F.frame ? F.frame : 1;
     G.scene_tex = t->id; G.sw = t->w; G.sh = t->h; G.sfmt = t->fmt;
     return G.sw > 0 && G.sh > 0 && G.sw <= 8192 && G.sh <= 8192;
+}
+static int find_scene_texture(void) { return find_scene_texture_as(0); }
+
+/* (motion-blur stream) When worms are hidden behind something, the engine draws the lit scene into
+   one texture, switches the framebuffer to the other one and has PostProcess.cg (Silhouette_PC,
+   RecombineWorms) rebuild the whole frame there from the first, worms shown through walls. Work
+   done at that point on the framebuffer's texture would be painted over, so the depth of field and
+   the motion blur go to the texture the lit scene was drawn into. */
+static int find_lit_texture(void)
+{
+    GLint type = 0, name = 0;
+    if (F.lit_tex && glIsTexture(F.lit_tex)) {
+        pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+        if (type == GL_TEXTURE) pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+        if ((GLuint)name != F.lit_tex && !F.lit_redirects++)
+            rt_log("post: the lit scene is in texture %u, the framebuffer now draws into %u (worm silhouettes): depth of field "
+                   "and motion blur go to %u", F.lit_tex, name, F.lit_tex);
+        return find_scene_texture_as(F.lit_tex);
+    }
+    return find_scene_texture();
 }
 
 static int is_float_fmt(GLint f) { return f == GL_RGBA16F || f == 0x8814 /* RGBA32F */ || f == 0x881B /* RGB16F */; }
@@ -457,7 +479,10 @@ static void common_uniforms(GLuint prog, u32 dw, u32 dh, u32 sw, u32 sh)
     set4(prog, "uSrc", (float)sw, (float)sh, 1.0f / sw, 1.0f / sh);
     set4(prog, "uTone", S.exposure, S.contrast, S.knee, mood_sat());
     set4(prog, "uGrade", mood_warm(), S.vignette, S.bloom, S.dither ? 1.0f : 0.0f);
-    set4(prog, "uAuto", S.auto_exposure, S.auto_key > 0.01f ? S.auto_key : 0.01f, 0.04f, 0);
+    /* at night (grade_auto) auto exposure only darkens: brightening a night scene lifts it to grey
+       and pushes bright unlit sprites (smoke puffs) into the shoulder, flat cream */
+    set4(prog, "uAuto", S.auto_exposure, S.auto_key > 0.01f ? S.auto_key : 0.01f, 0.04f,
+         S.grade_auto ? 1.25f - 0.25f * F.night : 1.25f);
     set4(prog, "uBloom", S.bloom_threshold, S.bloom_knee, 0, 0);
     set4(prog, "uFrame", S.dof_speed, (float)(F.frame & 1023), 0, 0);
 }
@@ -517,9 +542,9 @@ static void run_dof(void)
     u32 mw = 0, mh = 0, vw = 0, vh = 0;
     int o8;
     F.dof_done = 1;
-    if (motion_wanted() && ready() && find_scene_texture())         /* motion-blur stream: camera motion blur */
+    if (motion_wanted() && ready() && find_lit_texture())           /* motion-blur stream: camera motion blur */
         motion_apply(G.scene_tex, G.sw, G.sh, !is_float_fmt(G.sfmt));  /* (motion.c), before the depth of field */
-    if (S.dof <= 0 || !ready() || !find_scene_texture()) return;
+    if (S.dof <= 0 || !ready() || !find_lit_texture()) return;     /* (motion-blur stream: find_lit_texture) */
     mask = rt_post_mask(&mw, &mh, &vw, &vh);
     if (!mask || !mw || !mh || !vw || !vh) return;
     o8 = !is_float_fmt(G.sfmt);
@@ -686,6 +711,8 @@ static int in_main(void)
     return S.on && F.scene_seen && F.main_known && F.cur_fbo == F.main_fbo && F.scene_fbo == F.cur_fbo;
 }
 
+int post_main_view(void) { return in_main(); }    /* motion-blur stream (motion.c: moving objects) */
+
 void post_bind_fbo(GLenum target, GLuint id)
 {
     if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER) return;
@@ -709,6 +736,13 @@ void post_before_draw(u32 cls, const float *view)
         if ((GLuint)v != F.cur_fbo) F.fbo_mismatch++;
         F.cur_fbo = (GLuint)v;
         F.scene_fbo = F.cur_fbo; F.scene_seen = 1; F.lit_after = 0;
+        F.lit_tex = 0;                                  /* (motion-blur stream) see find_lit_texture */
+        if (S.on && pg_init()) {
+            GLint type = 0, name = 0;
+            pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+            if (type == GL_TEXTURE) pg.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+            F.lit_tex = name > 0 ? (GLuint)name : 0;
+        }
         F.dof_done = F.post_done = 0;
         if (view) memcpy(F.scene_view, view, sizeof F.scene_view);
         return;
@@ -822,7 +856,7 @@ void post_frame_end(void)
             }
             rt_log("post: mood: sun colour %.2f %.2f %.2f, night %.2f; scene mean luminance %.3f (log2 %.2f), auto exposure x%.2f",
                    F.light_col[0], F.light_col[1], F.light_col[2], F.night, pow(2.0, fx[2]), fx[2],
-                   S.auto_exposure > 0 && fx[3] > 0.5f ? fmin(fmax(pow(2.0, (log2(S.auto_key) - fx[2]) * S.auto_exposure), 0.8), 1.25) : 1.0);
+                   S.auto_exposure > 0 && fx[3] > 0.5f ? fmin(fmax(pow(2.0, (log2(S.auto_key) - fx[2]) * S.auto_exposure), 0.8), S.grade_auto ? 1.25 - 0.25 * F.night : 1.25) : 1.0);
         }
         F.runs = F.dof_runs = 0; F.scenes = F.binds = F.fbo_mismatch = F.worm_runs = 0;
     }

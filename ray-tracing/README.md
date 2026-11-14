@@ -113,7 +113,7 @@ real game exists but has not been tried on one.
 | `costprobe.sh`, `perfprobe.sh`, `motionprobe.sh`, `sunprobe.sh`, `sunprobe2.sh` | GPU cost per feature (feature off between two baselines), `gi_rate` noise/flicker, `gi_rate` in motion, and the fixed-view sun visibility checks |
 | `round.c` | Rounded shapes: PN-triangle subdivision of worm and prop draws (included by `wumrt.c`) |
 | `shape_hd.sh` | 1080p before/after on the active worm (paused, scale = 0.5, puts 480x270 back); any setting with SET/A/B, PLAY=1 also logs the cost in play |
-| `shape_play.sh` | In-play cost of `round_casters` 1 vs 2 at 480x270, camera close to the active worm |
+| `shape_play.sh` | In-play cost of the tracer copy of rounded worms (round_casters 1, 2, 2 at full size) at 480x270, camera close to the active worm |
 | `grassy.sh` | Restart the sandbox until Quick Game lands on a level with a lot of grass terrain (`LEVEL=NAME sh go.sh` or `rt.py level NAME` now pick one directly: Apple Core Island has plenty) |
 | `wumrt_characters.ini`, `char_ab.py`, `lookat.py` | Which textures are the worms' skin, face and eyes (same hash key); before/after of the character lighting on the paused view; aim the free camera at a world point (the worms' positions are in the log) |
 | `ab_capture.py`, `ab_label.py`, `ab_setting.py` | Before/after screenshots of the running sandbox match (stock, sun shadows, everything) and captioned comparison images, in `captures/` |
@@ -173,10 +173,13 @@ reflection_strength = 1
 water_style = 0 # stylised sea: depth colour, shore foam, sun glints (needs reflections = 1); see "Stylised sea"
 specular = 1    # materials and traced reflections on glossy surfaces
 specular_strength = 1
+clearcoat = 0         # clear coat sun highlight on materials with a COAT column (toy plastic, paint, glass); needs specular = 1
 smooth = 1      # trace from the smooth surface the vertex normals describe (0 = flat triangles)
 round = 1       # draw worms and props as rounded patches (0 = off, the default); see "Rounded shapes"
 round_level = 3 # small triangles along each edge (2..6)
 round_casters = 1     # the tracer traces the rounded mesh: 0 never, 1 props, 2 also worms (removes the bright fringe on close worms; cost below)
+round_caster_pixels = 40  # with 2: moving worm parts are rounded for the tracer only from this radius on screen
+round_caster_steps = 2    # with 2: steps per edge of that copy (2..6)
 round_bevel = 1       # rounded highlights along the hard edges of props (0 = off, the default)
 round_min_pixels = 10 # meshes smaller than this radius on screen are drawn as they are
 round_full_pixels = 40  # worms smaller than this radius on screen get 2 steps instead of round_level
@@ -352,10 +355,12 @@ the real game (`WormsXHD/WormsMayhem.exe`).
 ## Review sets
 
 `review.py` (with `review_gallery.html`) shoots repeatable before/after sets: four levels
-(Apple Core Island, This Game Does Dragon, Grave Danger, Ice, Ice, Maybe) x three views (wide:
+(Apple Core Island, This Game Does Dragon, Grave Danger, Ice, Ice, Maybe) x four views (wide:
 a stored free-camera pose per level in `review_poses.json`; mid and close: relative to the
-match's start camera, which looks at the active worm) x presets, every preset of a level in
-the same paused match so only the rendering differs:
+match's start camera, which looks at the active worm; hero: swung 65 degrees round that worm,
+low and nearly level, the worm left of centre with the level behind it, so depth of field,
+haze and rim light show) plus "shore" on Apple (a fixed pose: cliffs, sand, sea) x presets,
+every preset of a level in the same paused match so only the rendering differs:
 
 ```
 python review.py kit baseline|current       # snapshot this copy's build: core, patched CG, compute shaders,
@@ -363,7 +368,15 @@ python review.py kit baseline|current       # snapshot this copy's build: core, 
 python review.py shoot MILESTONE [KITS]     # 1280x720, scale 0.5; into captures/review/MILESTONE/
 python review.py label MILESTONE            # side-by-side sheets with captions
 python review.py gallery MILESTONE "LABEL"  # compressed images + gallery.json for the gallery page
+python review.py smoke MILESTONE LEVEL KITS # play until an explosion (fx_watch.py --log GLOW with
+                                            # fx_log = 1), freeze it, shoot the game's view per kit
 ```
+
+Presets are `stock`, `baseline`, `current` and `late` (any kit name works; these four get captions
+and colours). `shoot` also takes `--levels apple,grave` and `--res WxH`; a level whose start or
+pause fails, or whose first frame is black, is started once more, and black frames are flagged
+in the log. A milestone folder may hold `columns.json` ({"stock": "...", ...}): the gallery page
+shows it on top as what each column contains.
 
 "stock" is the game's own CG with `rt = 0`, no shells, scatter or relief and no replacement
 textures (the review sandbox's `wumrt_textures` points at an empty folder until stock is shot,
@@ -375,7 +388,9 @@ pause box and the menus out of the picture: the engine draws them into its scene
 after the scene, starting with the first fixed-function draw after the sun-lit pass, and every
 draw from there on is skipped except the copy to the window. Keep it at 0 while navigating
 menus (`rt.py screen` and `level` read the pause box and menus from the screen).
-`hide_hud = 2` also logs one frame's draws after the shadow pass.
+`hide_hud = 2` also logs one frame's draws after the shadow pass. Known issue: in some paused
+states `hide_hud = 1` gives a fully black frame (seen on This Game Does Dragon and on frames
+frozen by `fx_watch.py`); `smoke` then shoots that frame with the HUD shown.
 
 ## Measured cost
 
@@ -813,7 +828,9 @@ the distance of the sea floor or the sky behind it; the picture-in-picture view 
 processed; FXAA softens fine texture a little. The night grade (`grade_auto`) was seen on a night Apple Core match (sun colour 0.38 0.31 0.75 -> night 1.00,
 scene mean luminance 0.055, auto exposure x1.25): the night stays purple, slightly cooler and lifted, not crushed
 (`film_exp3_compare.png`); Grave Danger's dusk has a greenish sun and counts as day. Auto exposure lifts dark
-levels by up to 25%. Explosions (`film_exp2_off/on.png`, a fire jet frozen at 1080p with `fx = 1`): with
+levels by up to 25%, but not at night with `grade_auto = 1` (there it only darkens): a soak test on a night Grave
+Danger showed the game's cream smoke puffs pushed into the tone shoulder by that lift, flat and nearly white
+(measured R 214-245 across a puff); the cap is reasoned from those numbers, not re-shot with a puff on screen. Explosions (`film_exp2_off/on.png`, a fire jet frozen at 1080p with `fx = 1`): with
 `bloom_threshold = 1.0` and `bloom = 0.25` the jet gets a soft halo at its hot core and keeps its shape, no haze
 over the scene (judged with the earlier bloom 0.25 from 1.0; the chosen 0.15 from 1.2 is gentler); particles keep animating while paused, so the two shots are about 2 s apart. Not tested in play mode or at real 1080p
 without `scale = 0.5`.
@@ -894,6 +911,18 @@ worm (`shape_play.sh`): 12 to 13 worm parts per frame rounded in the shadow pass
 about 2 ms of CPU per frame more, still at the 30 fps cap; GPU time not measurable (shared
 GPU). Default in code stays 1.
 
+That cost was then cut: the shadow pass only rounds a moving part whose radius on screen is
+at least `round_caster_pixels` (40; below that the band it removes is under a pixel wide), and
+with `round_caster_steps` (2) steps per edge, 4x the triangles instead of 9x (the outline then
+differs from the main pass's 3 steps by about a seventh of the bulge, under a pixel). In play
+at 480x270, 22 units from a worm (`shape_play.sh`, three settings one after the other on the
+same view): `round_casters = 1`: rounding 1.08 ms, tracer collect 0.89 ms; 2 with these
+defaults: 0.8 to 1.0 ms and 0.81 ms (no part is that big at 480x270, nothing made in the
+shadow pass); 2 with every part from 10 px at 6 steps (as first merged): 2.1 ms and 4.4 ms. At
+1080p (scale 0.5) with the match running, 11 close worm parts per frame were rounded in the
+shadow pass and the band was gone (`captures/shape_hd_live_round_casters.png`, 2x crop
+`shape_hd_live_round_casters_crop.png`: orange band on both edges with 1, none with 2).
+
 Offline check of the patch code (a test program, not part of the build): an icosahedron's
 face centres move from radius 0.79 to 0.94 (sphere = 1); an 8-sided cylinder's rim goes from
 0.924 (octagon) to 0.993..1.0; a cube with split normals is left alone; no cracks with shared
@@ -935,6 +964,25 @@ large level pieces are excluded by size. Its look has not been judged in the gam
 off.
 
 Not done: GPU-skinned meshes (programs named `*Skinned`) are left alone (none seen in use).
+
+## Clear coat
+
+For the glossy, toy-like look of animated films: plastic, enamel paint, glass and glazed
+tiles get a second, sharp highlight of the sun, as from a thin varnish over the surface.
+`wumrt_materials.ini` takes an optional sixth column COAT (0..1, after EMISSIVE) per texture;
+the setting `clearcoat` (0 = off, the default in code; up to 8) scales it. The tracer adds,
+where the camera ray lands on such a material and the sun reaches it, Schlick Fresnel
+(f0 = 0.04) times a normalised Blinn-Phong lobe of power 400 to what the surface mirrors
+(the same output as `specular = 1`, which the lit shaders already add), so it needs
+`specular = 1` and no Cg change: face-on the peak is 0.65 x the sunlight per unit of COAT,
+brighter towards grazing angles, capped at 4 x. It is meant to be bright enough for the film
+post's bloom. Constant work per pixel, no loop. The mirror ray of `specular = 1` is unchanged.
+
+Labels (materials.py `todo` sheets, by eye): 57 more textures were labelled (plastics,
+painted metal such as oil drums, mines and machine parts, signs and posters, glass, glazed
+tiles; 4 more metals), and the painted, glass and glazed entries already there got a COAT
+(1.0 at roughness 0.30 or less, 0.8 at 0.35, 0.6 at 0.40, 0.4 above). Metals, wood, stone,
+cloth and food have none. 150 entries, 106 with a coat.
 
 ## Light from effects
 
@@ -1122,6 +1170,26 @@ and stay sharp.
   background behind it.
 - A camera cut (turn over `motion_blur_cut` degrees, default 20, or a jump over
   `motion_blur_jump` world units, default 400) gives no blur that frame.
+- Moving objects (`motion_blur_objects = 1`, off in code): every sun-lit draw of the main view is
+  known by its buffers, count and texture; last frame's draw with the same key and the nearest
+  position gives last frame's model matrix. When it changed, the mesh is drawn once more right
+  then with a small GLSL program into a velocity buffer (RGBA32F + depth: screen motion from this
+  and last frame's model x view x projection, eye distance). The blur pass uses that velocity
+  where the tracer's distance agrees. A 16 x 16 tile pass keeps the longest motion nearby, so a
+  fast object streaks over the background behind it (each tap is a moment of the shutter: a
+  nearer tap shows if its own smear reaches the pixel). CPU-skinned worms are not covered (their
+  motion is in the vertices); `motion_blur_obj_jump` (default 300) treats a bigger jump as new.
+  Apple Core has ~23 small moving props per frame (bobbing, a spinning teleporter pad): the
+  re-draws cost little (blur pass 0.085-0.11 ms GPU per frame with objects at 480x270).
+- Worm silhouettes: when worms are hidden behind something, the engine draws the lit scene into
+  one texture, switches the framebuffer to the other and has PostProcess.cg (Silhouette_PC,
+  RecombineWorms) rebuild the whole frame there. Anything written to the framebuffer's texture
+  at the depth of field's point was painted over (motion blur AND depth of field). post.c now
+  remembers the texture attached at the landscape draw and runs both on it
+  (`find_lit_texture`; the log says "the lit scene is in texture A, the framebuffer now draws
+  into B" once).
+- `motion_blur_debug = 1` paints the blur vectors (red/green = horizontal/vertical, 8 px = full),
+  pixels with an object velocity (blue) and self-moved surfaces (grey).
 - Settings: `motion_blur` (shutter), `motion_blur_max` (longest smear, share of the view
   height, default 0.04), `motion_blur_taps` (2..16, default 12), `motion_blur_log` (runs, still
   and cut frames, GPU time every 300 frames), `motion_blur_split` (1 = only the right half is
@@ -1134,9 +1202,13 @@ and stay sharp.
   frames ran the pass. Captures (stream copy): `captures/mb_free_split.png` (1.5 deg/frame
   turn, right half blurred), `mb_free_after.png` (same view held), `mb_fast_split.png`
   (4 deg/frame), `mb_move_split.png` (sideways move), `mb_turn_crop_compare.png`.
-- Not verified: in play with the game's own camera moves and shakes, 1080p, and how the uneven
-  frame pacing (50 Hz camera ticks vs the frame rate) makes the smear length vary from frame to
-  frame.
+- Objects checked on the teleporter pad (`captures/mb_pad_compare.png`: camera still, objects
+  off vs on, the spinning pad's swirl smeared along its turn) and in the debug view
+  (`mb_dbg_fixed.png`). The silhouette fix checked with the debug view (before: no change on
+  screen; after: the vectors show).
+- Not verified: a flying shell, barrel or sheep (none caught yet), in play with the game's own
+  camera moves and shakes, 1080p, and how the uneven frame pacing (50 Hz camera ticks vs the
+  frame rate) makes the smear length vary from frame to frame.
 
 ## Textures
 

@@ -140,6 +140,7 @@ void rt_set_smooth(int on);
 void rt_set_textures(int compress, int max_size);
 /* Trace what glossy surfaces mirror (one ray per pixel whose material is shiny enough). */
 void rt_set_specular(int on, float strength);
+void rt_set_clearcoat(float strength);    /* clear coat highlight on materials with a coat column (0 = off) */
 /* The reflection texture of the scene camera being drawn (always a valid texture once that
    camera has a mask): rgb = mirrored light for the surface at each pixel. */
 GLuint rt_last_reflection(void);

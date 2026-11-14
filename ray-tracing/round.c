@@ -39,6 +39,10 @@ static int rnd_logged;
 static float round_min_pixels = 10.0f;  /* round_min_pixels: meshes smaller than this radius on screen are drawn as they are */
 static u32 rnd_small;                   /* draws left alone this frame because they were small */
 static float round_full_pixels = 40.0f; /* round_full_pixels: animated meshes smaller than this radius on screen get 2 steps */
+static float round_caster_pixels = 40.0f; /* round_caster_pixels: the shadow pass rounds a moving worm part only from this
+                                           radius on screen (below it the fringe it removes is under a pixel) */
+static u32 round_caster_steps = 2;     /* round_caster_steps: steps per edge of the shadow pass's own rounding (2 = 4x the
+                                           triangles; the main pass's 3 only moves the outline by about 1/7 more of the bulge) */
 static u32 rnd_cap_n = 6;               /* most steps for the draw being made (main pass) */   /* a mesh whose control points stray less than this share of an edge's length is flat */
 
 #define RND_MESHES 256
@@ -1066,10 +1070,10 @@ static int round_caster(const struct rt_draw *d, struct rt_draw *out)
     if (m->topo_key && m->ntri > round_max_tris) return 0;
     rnd_caster_cap = 0;
     if (round_casters >= 2 && m->corner && cur_vp >= 0 && vp_on && (progs[cur_vp].have & 1)) {
-        /* animated meshes the shadow pass may have to round itself: the same size test as the
-           main pass (small ones stay as they are, mid-sized ones get 2 steps) */
+        /* animated meshes the shadow pass may have to round itself: only big ones on screen
+           (round_caster_pixels), and with round_caster_steps steps per edge */
         float px = rnd_pixels_cam(m, d, progs[cur_vp].model);
-        rnd_caster_cap = px < round_min_pixels ? 0 : px < round_full_pixels ? 2 : 6;
+        rnd_caster_cap = (px < round_caster_pixels || px < round_min_pixels) ? 0 : round_caster_steps < 2 ? 2 : round_caster_steps;
     }
     if (!rnd_update(m, d, 1) || m->ntri > round_max_tris) return 0;
     if (m->dynamic && round_casters < 2) return 0;     /* animated: the tracer would rebuild 9x the triangles every frame */
@@ -1102,7 +1106,7 @@ static void round_frame_end(void)
 static void round_settings_begin(void)       /* defaults for what wumrt.ini leaves out */
 {
     round_on = 0; round_level = 3; round_casters = 1; round_strength = 1.0f; round_max_tris = 12000;
-    round_min_bend = 0.004f; round_dense = 0.06f; round_min_pixels = 10.0f; round_full_pixels = 40.0f; round_bevel = 0; round_bevel_max = 40.0f;
+    round_min_bend = 0.004f; round_dense = 0.06f; round_min_pixels = 10.0f; round_full_pixels = 40.0f; round_caster_pixels = 40.0f; round_caster_steps = 2; round_bevel = 0; round_bevel_max = 40.0f;
 }
 
 static void round_read_settings(const char *name, float v)
@@ -1116,6 +1120,8 @@ static void round_read_settings(const char *name, float v)
     else if (!strcmp(name, "round_dense")) round_dense = v;
     else if (!strcmp(name, "round_min_pixels")) round_min_pixels = v;
     else if (!strcmp(name, "round_full_pixels")) round_full_pixels = v;
+    else if (!strcmp(name, "round_caster_pixels")) round_caster_pixels = v;
+    else if (!strcmp(name, "round_caster_steps")) round_caster_steps = v < 2 ? 2 : v > 6 ? 6 : (u32)v;
     else if (!strcmp(name, "round_bevel")) round_bevel = v != 0;
     else if (!strcmp(name, "round_bevel_max")) round_bevel_max = v;
     else return;

@@ -1,15 +1,21 @@
 #version 430
-// Camera motion blur (motion.c): a film shutter's smear along the camera's motion, on the
-// game's scene texture right after the lit scene (post.c, at the depth of field's place, so
-// particles, name labels and the HUD drawn later stay sharp). Every loop has a constant bound.
+// Motion blur (motion.c): a film shutter's smear along the camera's motion and along moving
+// objects, on the game's scene texture right after the lit scene (post.c, at the depth of
+// field's place, so particles, name labels and the HUD drawn later stay sharp). Every loop has
+// a constant bound.
 //
 // PASS 1 VEL     mask (eye distance) + this and last frame's camera -> vel image:
 //                xy blur vector in pixels (shutter-scaled, clamped), z eye distance, w 1 = the
-//                surface moved by itself (it was not there last frame), so it is not smeared
-// PASS 2 GATHER  scene + vel -> tmp: box-shutter average of up to 16 taps along the pixel's own
-//                blur vector; a nearer tap only counts if its own smear reaches this pixel
-//                (so the foreground does not bleed onto the background behind it)
-// PASS 3 STORE   tmp -> scene texture (OUT_RGBA8 for an 8-bit scene texture)
+//                surface moved by itself and no object velocity is known for it (not smeared).
+//                Where the object velocity buffer (moving rigid meshes re-drawn by motion.c)
+//                shows the same surface, its velocity (object + camera) is used instead.
+// PASS 4 TILES   vel -> tiles: the longest blur vector in each 16 x 16 tile
+// PASS 2 GATHER  scene + vel + tiles -> tmp: up to 16 taps along the longest blur nearby (or the
+//                pixel's own when that is as long). Each tap is a moment of the shutter: a nearer
+//                tap shows there if its own smear reaches this pixel (a fast object streaks over
+//                the background), a tap at the same depth or behind if it lies on this pixel's own
+//                smear; otherwise the moment shows the pixel itself.
+// PASS 3 STORE   tmp -> scene texture (OUT_RGBA8 for an 8-bit scene texture), only where blurred
 //
 // The scene texture holds sRGB-encoded colour (RGBA16F with hdr = 1, may go above 1).
 
@@ -20,7 +26,8 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 uniform vec4 uView;        // viewport width, height (scene pixels), mask width, height
 uniform vec4 uBlur;        // shutter fraction, largest blur in pixels, taps (<= 16), prev mask valid (1/0)
-uniform vec4 uFrame;       // frame number, 1 = smear only the right half (A/B check), -, -
+uniform vec4 uFrame;       // frame number, 1 = smear only the right half (A/B check), 1 = debug view, -
+uniform vec4 uObj;         // object velocities this frame (1/0), -, tiles across, tiles down
 uniform mat4 uVP;          // this frame's view * projection
 uniform mat4 uPrevVP;      // last frame's
 uniform vec3 uEye;         // this frame's eye (world)
@@ -30,13 +37,34 @@ uniform vec3 uDx;
 uniform vec3 uDy;
 
 const float FAR = 60000.0;
+const int TILE = 16;
+const float MIN_BLUR = 0.35;
 
 vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
 vec3 toGamma(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
 
+#if PASS == 2 || PASS == 3
+layout(rgba16f, binding = 3) uniform readonly image2D uTilesImg;
+// the longest blur vector in the 3 x 3 tiles around this pixel's tile
+vec2 nearMax(ivec2 pix)
+{
+    ivec2 t = pix / TILE, n = ivec2(uObj.zw);
+    vec2 best = vec2(0.0);
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            ivec2 q = t + ivec2(i, j);
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, n))) continue;
+            vec2 v = imageLoad(uTilesImg, q).xy;
+            if (dot(v, v) > dot(best, best)) best = v;
+        }
+    return best;
+}
+#endif
+
 #if PASS == 1
 layout(binding = 0) uniform sampler2D uMaskTex;
 layout(binding = 1) uniform sampler2D uPrevMaskTex;
+layout(binding = 2) uniform sampler2D uObjTex;
 layout(rgba16f, binding = 0) uniform writeonly image2D uVel;
 
 vec2 project(mat4 m, vec4 p, out bool ok)
@@ -63,9 +91,15 @@ void main()
     vec2 was = project(uPrevVP, p, ok1);
     vec2 v = ok0 && ok1 ? (now - was) * uView.xy * uBlur.x : vec2(0.0);
     float moved = 0.0;
-    if (!sky && ok1 && uBlur.w > 0.5 && all(greaterThan(was, vec2(0.0))) && all(lessThan(was, vec2(1.0)))) {
+    bool object = false;
+    if (!sky && uObj.x > 0.5) {
+        // a moving rigid object re-drawn by motion.c, if it is what the tracer sees here
+        vec4 o = texelFetch(uObjTex, pix, 0);
+        if (o.w > 0.5 && abs(o.z - d) < 0.05 * d + 3.0) { v = o.xy * uBlur.x; object = true; }
+    }
+    if (!sky && !object && ok1 && uBlur.w > 0.5 && all(greaterThan(was, vec2(0.0))) && all(lessThan(was, vec2(1.0)))) {
         // Where a still point would have been last frame: if something farther was there in
-        // all four nearest mask texels, this surface moved (a worm or shell the camera follows).
+        // all four nearest mask texels, this surface moved (a worm the camera follows).
         float expect = length(p.xyz - uPrevEye);
         float tol = 0.03 * expect + 1.0;
         vec2 q = was * uView.zw - 0.5;
@@ -82,8 +116,29 @@ void main()
     if (moved > 0.5) v = vec2(0.0);
     float len = length(v);
     if (len > uBlur.y) v *= uBlur.y / len;
-    if (len < 0.35) v = vec2(0.0);
-    imageStore(uVel, pix, vec4(v, sky ? FAR : d, moved));
+    if (len < MIN_BLUR) v = vec2(0.0);
+    imageStore(uVel, pix, vec4(v, sky ? FAR : d, object ? 2.0 : moved));
+}
+#endif
+
+#if PASS == 4
+layout(rgba16f, binding = 1) uniform readonly image2D uVelImg;
+layout(rgba16f, binding = 3) uniform writeonly image2D uTiles;
+
+void main()
+{
+    ivec2 t = ivec2(gl_GlobalInvocationID.xy);
+    if (t.x >= int(uObj.z) || t.y >= int(uObj.w)) return;
+    ivec2 size = ivec2(uView.xy);
+    vec2 best = vec2(0.0);
+    for (int j = 0; j < TILE; j++)
+        for (int i = 0; i < TILE; i++) {
+            ivec2 q = t * TILE + ivec2(i, j);
+            if (q.x >= size.x || q.y >= size.y) continue;
+            vec2 v = imageLoad(uVelImg, q).xy;
+            if (dot(v, v) > dot(best, best)) best = v;
+        }
+    imageStore(uTiles, t, vec4(best, 0.0, 0.0));
 }
 #endif
 
@@ -100,27 +155,30 @@ void main()
     vec4 self = texelFetch(uScene, pix, 0);
     vec4 vx = imageLoad(uVelImg, pix);
     float lx = length(vx.xy);
-    if (lx < 0.35) { imageStore(uTmp, pix, self); return; }
+    vec2 vn = nearMax(pix);
+    float ln = length(vn);
+    if (ln < MIN_BLUR) { imageStore(uTmp, pix, self); return; }
+    // sample along the longest smear nearby, unless this pixel's own is about as long
+    vec2 dirv = ln > lx + 1.0 ? vn : vx.xy;
+    float ld = length(dirv);
     int n = int(clamp(uBlur.z, 2.0, 16.0));
     // interleaved gradient noise: spreads the taps' positions so the few taps do not band
     float jit = fract(52.9829189 * fract(dot(vec2(pix) + float(int(uFrame.x) & 7) * 5.588238, vec2(0.06711056, 0.00583715)))) - 0.5;
+    vec3 cself = toLinear(self.rgb);
     vec3 sum = vec3(0.0);
-    float wsum = 0.0;
     for (int i = 0; i < 16; i++) {
         if (i >= n) break;
         float s = (float(i) + 0.5 + jit) / float(n) - 0.5;      // -0.5 .. 0.5 of the shutter
-        ivec2 q = clamp(ivec2(floor(vec2(pix) + 0.5 + vx.xy * s)), ivec2(0), size - 1);
+        ivec2 q = clamp(ivec2(floor(vec2(pix) + 0.5 + dirv * s)), ivec2(0), size - 1);
         vec4 vy = imageLoad(uVelImg, q);
-        float off = abs(s) * lx;                                 // pixels from this one
-        // a tap nearer to the camera than this pixel counts only where its own smear reaches here
+        float off = abs(s) * ld;                                 // pixels from this one
         float front = clamp((vx.z - vy.z) / (0.05 * vx.z + 2.0), 0.0, 1.0);
-        float reach = clamp(0.5 * length(vy.xy) - off + 0.5, 0.0, 1.0);
-        float w = mix(1.0, reach, front);
-        sum += toLinear(texelFetch(uScene, q, 0).rgb) * w;
-        wsum += w;
+        float reach = clamp(0.5 * length(vy.xy) - off + 0.5, 0.0, 1.0);   // the tap's smear reaches here
+        float own = clamp(0.5 * lx - off + 0.5, 0.0, 1.0);                // the tap is on this pixel's smear
+        float w = front * reach + (1.0 - front) * own;
+        sum += mix(cself, toLinear(texelFetch(uScene, q, 0).rgb), w);
     }
-    vec3 c = wsum > 1e-3 ? toGamma(sum / wsum) : self.rgb;
-    imageStore(uTmp, pix, vec4(c, self.a));
+    imageStore(uTmp, pix, vec4(toGamma(sum / float(n)), self.a));
 }
 #endif
 
@@ -137,7 +195,16 @@ void main()
 {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     if (pix.x >= int(uView.x) || pix.y >= int(uView.y)) return;
-    if (length(imageLoad(uVelImg, pix).xy) < 0.35) return;     // not smeared: left exactly as it was
+    if (uFrame.z > 0.5) {
+        // debug view: red / green = horizontal / vertical blur (8 px = full), blue = object velocity,
+        // grey = moved by itself (not smeared)
+        vec4 v = imageLoad(uVelImg, pix);
+        vec3 c = vec3(abs(v.xy) / 8.0, v.w > 1.5 ? 1.0 : 0.0);
+        if (v.w > 0.5 && v.w < 1.5) c = vec3(0.5);
+        imageStore(uOut, pix, vec4(c, 1.0));
+        return;
+    }
+    if (length(nearMax(pix)) < MIN_BLUR) return;                // not smeared: left exactly as it was
     if (uFrame.y > 0.5 && pix.x < int(uView.x) / 2) return;
     imageStore(uOut, pix, imageLoad(uTmpImg, pix));
 }

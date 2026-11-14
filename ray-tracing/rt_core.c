@@ -291,6 +291,7 @@ static struct {
     GLint u_char; int char_on; float char_depth, char_contact, char_reach;   /* characters (rt_set_characters) */
     int smooth;
     int specular; float specular_strength;          /* trace what glossy surfaces mirror */
+    float clearcoat;                                /* strength of the clear coat highlight (0 = off) */
     int reflect; float reflect_strength;            /* trace what the sea mirrors */
     int denoise;                                    /* filter passes for the indirect light */
     u32 last_cam, last_cam_frame;                   /* the scene camera whose draws are going on */
@@ -594,6 +595,7 @@ static struct { GLuint array; u32 used, nfree; unsigned short free_list[MAX_LAYE
    by a hash of the layer's pixels (texture ids and names are not stable or not known). */
 static struct layer_mat {
     float rough, refl, metal, emis[3]; u32 hash; int from_file, logged;
+    float coat;                     /* clear coat (wumrt_materials.ini 6th column, 0..1): toy plastic, car paint */
     float shell_h, shell_d;         /* grass or moss: relative height and blade density (0 = no shells) */
     int terrain_logged;
     u32 kind;                       /* what the terrain is made of (scatter.c: SK_*), 0 = not listed */
@@ -601,7 +603,7 @@ static struct layer_mat {
     u32 chr;                        /* on the characters (wumrt_characters.ini): 1 skin, 2 skin with the eyes, 3 eye */
 } mats[MAX_LAYERS];
 static int mats_dirty = 1;
-static struct { u32 hash; float rough, refl, metal, emis; } overrides[2048];
+static struct { u32 hash; float rough, refl, metal, emis, coat; } overrides[2048];
 static u32 n_overrides;
 static int overrides_loaded;
 /* wumrt_surfaces.ini: what a terrain texture is made of, one per line:
@@ -646,9 +648,10 @@ static void load_overrides(void)
     n_overrides = 0;
     if (!f) return;
     while (fgets(line, sizeof line, f) && n_overrides < 2048) {
-        u32 h; float a, b, c, e = 0;
-        if (sscanf(line, " %8x %f %f %f %f", &h, &a, &b, &c, &e) >= 4) {
+        u32 h; float a, b, c, e = 0, k = 0;
+        if (sscanf(line, " %8x %f %f %f %f %f", &h, &a, &b, &c, &e, &k) >= 4) {
             overrides[n_overrides].hash = h; overrides[n_overrides].rough = a; overrides[n_overrides].refl = b;
+            overrides[n_overrides].coat = k < 0 ? 0 : k > 1 ? 1 : k;
             overrides[n_overrides].metal = c; overrides[n_overrides++].emis = e;
         }
     }
@@ -706,6 +709,7 @@ static void layer_material_reset(u32 layer, u32 hash)
         if (overrides[i].hash == hash) {
             m->rough = overrides[i].rough; m->refl = overrides[i].refl; m->metal = overrides[i].metal;
             m->emis[0] = m->emis[1] = m->emis[2] = overrides[i].emis;
+            m->coat = overrides[i].coat;
             m->from_file = 1;
             break;
         }
@@ -2676,7 +2680,7 @@ static int trace(struct cam *c)
                 for (l = 0; l < MAX_LAYERS; l++) {
                     float *g = &gpu[l * 8];
                     g[0] = l < LY.used ? mats[l].rough : 1.0f; g[1] = mats[l].refl; g[2] = mats[l].metal; g[3] = (float)mats[l].chr;
-                    g[4] = mats[l].emis[0]; g[5] = mats[l].emis[1]; g[6] = mats[l].emis[2]; g[7] = 0;
+                    g[4] = mats[l].emis[0]; g[5] = mats[l].emis[1]; g[6] = mats[l].emis[2]; g[7] = mats[l].coat * R.clearcoat;
                 }
                 gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, R.buf_mat);
                 gl.BufferData(GL_SHADER_STORAGE_BUFFER, sizeof gpu, gpu, GL_DYNAMIC_DRAW);
@@ -2980,6 +2984,12 @@ void rt_set_smooth(int on)
 void rt_set_characters(int on, float depth, float contact, float reach)
 {
     R.char_on = on; R.char_depth = depth; R.char_contact = contact; R.char_reach = reach;
+}
+
+void rt_set_clearcoat(float strength)
+{
+    strength = strength < 0 ? 0 : strength > 8 ? 8 : strength;
+    if (strength != R.clearcoat) { R.clearcoat = strength; mats_dirty = 1; }
 }
 
 void rt_set_foliage(int on, float depth)

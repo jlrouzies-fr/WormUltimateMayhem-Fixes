@@ -708,6 +708,19 @@ void main()
                 vec3 seen = rt < 0.0 ? skyShown(rd, m.x * 5.0) : surfaceLight(p, rd, rt, rn, m.x * 4.0);
                 spec = weight * seen;
             }
+            // Clear coat (toy plastic, painted metal: wumrt_materials.ini 6th column times the
+            // clearcoat setting): a second, sharp highlight of the sun on a thin varnish over the
+            // surface, Schlick Fresnel with f0 = 0.04 and normalised Blinn-Phong of power 400
+            // (peak 0.65 x the sunlight face-on, brighter at grazing angles, capped at 4), so
+            // glossy props get a crisp white glint that the film post's bloom picks up.
+            float coat = mats[2 * int(pLayer) + 1].w;
+            if (coat > 0.0 && vis > 0.0) {
+                vec3 h = normalize(uSun - d);
+                float nl = max(dot(n, uSun), 0.0), nh = max(dot(n, h), 0.0);
+                float fc = 0.04 + 0.96 * pow(1.0 - max(dot(h, -d), 0.0), 5.0);
+                float lobe = 16.2 * pow(nh, 400.0);
+                spec += uSunCol * min(coat * fc * lobe * nl * vis, 4.0);
+            }
         }
     }
     // The sea is a flat mirror at a known height and is not part of the traced scene. Where
