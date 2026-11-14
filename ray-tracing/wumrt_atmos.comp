@@ -131,8 +131,10 @@ void main()
         open /= wsum;
         vec2 ds = (uv - uSun.xy) * vec2(uSize.x * uSize.w, 1.0);
         float fall = exp(-dot(ds, ds) * 3.0);
-        // over open sky the sun's own glare (post.c) and disc (sky stream) are already there
-        float shaft = open * fall * (sky ? 0.3 : 1.0);
+        // Only where the line to the sun is partly blocked: a fully open line (open sea, clear
+        // sky) is the sun's glare (post.c) and disc (sky stream), not a shaft, and must not be
+        // added again as a flat glow. Over open sky the rays are half as strong.
+        float shaft = open * min(1.0, 3.0 * (1.0 - open)) * fall * (sky ? 0.5 : 1.0);
         c += uSunCol.rgb * (uSunCol.w * uAtmos2.z * 0.6 * shaft);
         changed = true;
     }

@@ -1000,6 +1000,9 @@ GLuint rt_normal_map(u32 tex)
    to the log, which is how the textures to list in wumrt_surfaces.ini are found. */
 static u32 layer_for_texture(u32 tex);
 
+static float moss_rock;     /* moss: moss on rock tops (0 = off), see rt_set_moss_rock */
+void rt_set_moss_rock(float strength) { moss_rock = strength < 0 ? 0 : strength; }
+
 int rt_shell(u32 tex, float *out)
 {
     struct layer_mat *m;
@@ -1012,6 +1015,8 @@ int rt_shell(u32 tex, float *out)
         m->terrain_logged = 1;
         rt_log("rt: terrain texture %08x%s", m->hash, m->shell_h > 0 ? " (shell layers)" : "");
     }
+    /* moss: rock textures get short moss shells on their tops (2 = rock moss) */
+    if (m->shell_h <= 0 && m->kind == 3 && moss_rock > 0) { out[0] = 0.3f; out[1] = 1.6f; return 2; }
     if (m->shell_h <= 0) return 0;
     out[0] = m->shell_h; out[1] = m->shell_d;
     return 1;

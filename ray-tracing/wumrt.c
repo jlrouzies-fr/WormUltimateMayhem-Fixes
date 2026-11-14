@@ -1513,6 +1513,7 @@ static int shell_shadow;                 /* 1 = the blades shade each other and 
 static float grass_wind;                 /* wind sway of shells and border tufts (0 = still) */
 static float blade_glow, blade_tip;      /* backlit blades (characters stream): glow, tip highlight */
 static float grass_patches;              /* painted colour patches over the grass (0 = none) */
+static float moss_rock_on;               /* moss: moss on rock tops, strength (0 = off) */
 
 /* Seconds, for the wind: wrapped every 2000 pi seconds (about 1.7 hours) so the shaders' sines
    keep their precision. */
@@ -1535,11 +1536,11 @@ static void draw_shells(u32 kind, GLenum mode, u32 first, u32 start, u32 end, u3
     struct prog *fp = (cur_fp >= 0 && fp_on) ? &progs[cur_fp] : NULL;
     void (__cdecl *update)(void *) = *(void (__cdecl **)(void *))IAT_cgUpdateProgramParameters;
     float sh[2] = { 0, 0 }, density, full, width = shell_width > 0.45f ? 0.45f : shell_width;
-    int i, n = shell_count > 64 ? 64 : shell_count;
+    int i, n = shell_count > 64 ? 64 : shell_count, smode = 0;
     LARGE_INTEGER t0, t1, freq;
     if (!vp || !fp || !vp->landscape || !vp->p_rt_shell || !fp->p_rt_shell) return;
     if (post_wants_terrain()) post_note_terrain(rt_terrain_hash(fp->tex0));   /* grade.c: which level */
-    if (n <= 0 || !rt_shell(fp->tex0, sh)) {
+    if (n <= 0 || !(smode = rt_shell(fp->tex0, sh))) {
         if (fp->shell_on) {
             real_cgGLSetParameter4f(fp->p_rt_shell, 0, 0, 0, 0);
             update(fp->h);
@@ -1552,8 +1553,12 @@ static void draw_shells(u32 kind, GLenum mode, u32 first, u32 start, u32 end, u3
     density = shell_density * sh[1];
     full = shell_height * sh[0];
     if (!shell_shadow) full = -full;         /* the shader reads the sign: negative = no sun test */
-    if (fp->p_rt_wind) real_cgGLSetParameter4f(fp->p_rt_wind, wind_time(), grass_wind, grass_patches, 0);
-    if (fp->p_rt_blade) real_cgGLSetParameter4f(fp->p_rt_blade, blade_glow, blade_tip, 0, 0);
+    if (smode == 2 && n > 8) n = 8;          /* moss: rock-top moss is short: fewer layers */
+    if (fp->p_rt_wind) {
+        if (smode == 2) real_cgGLSetParameter4f(fp->p_rt_wind, wind_time(), 0, 0, moss_rock_on);   /* moss: no sway, no patches */
+        else real_cgGLSetParameter4f(fp->p_rt_wind, wind_time(), grass_wind, grass_patches, 0);
+    }
+    if (fp->p_rt_blade) real_cgGLSetParameter4f(fp->p_rt_blade, smode == 2 ? 0 : blade_glow, blade_tip, 0, 0);
     for (i = n; i >= 1; i--) {
         float t = (float)i / (float)n;
         real_cgGLSetParameter4f(vp->p_rt_shell, t * shell_height * sh[0], 0, 0, 0);
@@ -1992,7 +1997,7 @@ static void read_settings(void)
     float wstyle = 0;
     float sh_height = 3.5f, sh_density = 0.3f, sh_width = 0.45f;
     int sh_shadow = 0;
-    float gr_wind = 0, gr_patches = 0;
+    float gr_wind = 0, gr_patches = 0, mr = 0;
     int scatter = 0;
     float sc_density = 1.0f, sc_size = 1.0f;
     float sk_wrap = 0, sk_trans = 0, sk_depth = 4.0f, sk_rim = 0, sk_catch = 0, sk_contact = 0, sk_reach = 20.0f;
@@ -2053,6 +2058,7 @@ static void read_settings(void)
         else if (!strcmp(name, "blade_glow")) blade_glow = v;
         else if (!strcmp(name, "blade_tip")) blade_tip = v;
         else if (!strcmp(name, "grass_patches")) gr_patches = v;
+        else if (!strcmp(name, "moss_rock")) mr = v;
         else if (!strcmp(name, "frame_timer")) ftimer = v != 0;
         else if (!strcmp(name, "hide_hud")) hud = (int)v;
         else if (!strcmp(name, "water_style")) wstyle = v;
@@ -2107,6 +2113,8 @@ static void read_settings(void)
     shell_shadow = sh_shadow;
     grass_wind = gr_wind;
     grass_patches = gr_patches;
+    moss_rock_on = mr;
+    rt_set_moss_rock(mr);
     frame_timer_on = ftimer;
     if (hud != hide_hud) hud_logged = 0;
     hide_hud = hud;

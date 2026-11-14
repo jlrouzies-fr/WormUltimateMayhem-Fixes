@@ -339,7 +339,7 @@ float RtShellCover( float2 g0, float t, float radius, float lod, float3 wind, fl
 	return best;
 }
 
-float RtShell( float4 rtShell, float4 rtWind, float2 texUv, float3 pos, float3 n, float3 l, out float2 uv, out float3 shade, out float sun )
+float RtShell( float4 rtShell, float4 rtWind, float upY, float2 texUv, float3 pos, float3 n, float3 l, out float2 uv, out float3 shade, out float sun )
 {
 	uv = texUv;
 	shade = 1;
@@ -396,6 +396,20 @@ float RtShell( float4 rtShell, float4 rtWind, float2 texUv, float3 pos, float3 n
 	float best = t > 0 ? RtShellCover( g0, t, min( rtShell.z, 0.45f ), lod, wind0, rtWind.x, footG, coverShade ) : 1;
 	if ( best <= 0 )
 		return 0;
+	// ---- moss: moss on rock tops (rtWind.w > 0, rock textures; see wumrt_surfaces.ini) ----
+	// Only where the rock faces up (upY = the world-up share of its normal) and a big soft
+	// noise says so; there the blades are cut off at the mask's height, so the moss makes
+	// soft cushions that thin out towards their edges, tinted green.
+	float mossMask = 1;
+	if ( rtWind.w > 0 )
+	{
+		float2 mw = wpos / 36;
+		float mn = sin( mw.x * 1.7f + sin( mw.y * 1.3f ) * 1.6f ) * sin( mw.y * 1.9f + sin( mw.x * 1.1f + 0.8f ) * 1.4f );
+		mossMask = saturate( smoothstep( 0.55f, 0.85f, upY ) * smoothstep( -0.25f, 0.35f, mn ) * rtWind.w );
+		if ( t > mossMask * 0.999f )
+			return 0;
+	}
+	// ---- end moss: moss on rock tops ----
 	float ln = dot( l, n );
 	if ( rtShell.w > 0 && t < 0.6f && ln > 0.05f && dot( pu, pu ) > 0 )
 	{
@@ -420,12 +434,16 @@ float RtShell( float4 rtShell, float4 rtWind, float2 texUv, float3 pos, float3 n
 		// The ground under the blades is in their shade: less where the blades' own sun shadows
 		// already darken it
 		shade = lerp( 1, rtShell.w > 0 ? 0.8f : 0.65f, lod );
+		if ( rtWind.w > 0 )		// moss: rock ground is shaded and greened only under the moss
+			shade = lerp( float3( 1, 1, 1 ), shade * float3( 0.8f, 1.0f, 0.65f ), mossMask );
 		if ( rtWind.z > 0 )
 			shade *= RtPatches( wpos, rtWind.z );
 		return 1;
 	}
 	uv = footG / cells;
 	shade = coverShade;
+	if ( rtWind.w > 0 )		// moss: rock-coloured blades turned moss green
+		shade *= float3( 0.62f, 1.12f, 0.42f );
 	// a blade takes the patch colour at its foot, so it is one colour
 	if ( rtWind.z > 0 )
 		shade *= RtPatches( uv * float2( length( pu ), length( pv ) ), rtWind.z );
@@ -717,6 +735,11 @@ rep("\t\t\t\t\t\tuniform float4x4 texTransform,\n\t\t\t\t\t\tuniform float4x4 sh
     "\t\tfloat flutter = 0.25f * sin( rtShell.y * 2.3f + inPos.x * 0.7f + inPos.z * 0.5f );\n"
     "\t\tinPos.xz += float2( 0.8f, 0.6f ) * ( tip * rtShell.z * 1.6f * ( gust + flutter ) );\n"
     "\t\tinColour.a = 1;\n\t}\n")
+rep("\toutTexCoord0 = mul( inTexCoord0, texTransform );\n\toutColour = inColour;\n",
+    "\toutTexCoord0 = mul( inTexCoord0, texTransform );\n"
+    "\t// wumrt moss: how much the surface faces world up, for moss on rock tops (z is unused)\n"
+    "\toutTexCoord0.z = normalize( mul( float4( inNormal, 0 ), model ).xyz ).y;\n"
+    "\toutColour = inColour;\n")
 rep("\t\t\t\t\t\tuniform float4x4 texTransform,\n\t\t\t\t\t\tuniform float4x4 shadowMatrix )\n{\n\tLandscapeVertexMain(",
     "\t\t\t\t\t\tuniform float4x4 texTransform,\n" + SHELL_UNIFORM +
     "\t\t\t\t\t\tuniform float4x4 shadowMatrix )\n{\n\tLandscapeVertexMain(")
@@ -744,7 +767,7 @@ rep("\tfloat3 n = normalize( inNormal );\n",
     "\trtAmbient *= RtHemi( n, inNormal, rtParams3 );\n")
 rep("\t// Test for being in shadow before doing the lighting calculations\n",
     "\tfloat2 rtShellUv;\n\tfloat3 rtShellShade;\n\tfloat rtShellSun;\n"
-    "\tif ( RtShell( rtShell, rtWind, inTexCoord0.xy, inPos, normalize( inNormal ), normalize( -inLightVector ), rtShellUv, rtShellShade, rtShellSun ) < 0.5f )\n\t\tdiscard;\n\n"
+    "\tif ( RtShell( rtShell, rtWind, inTexCoord0.z, inTexCoord0.xy, inPos, normalize( inNormal ), normalize( -inLightVector ), rtShellUv, rtShellShade, rtShellSun ) < 0.5f )\n\t\tdiscard;\n\n"
     "\t// Test for being in shadow before doing the lighting calculations\n")
 rep("\tfloat4 texCol = tex2D( texture0, inTexCoord0.xy );\n    outCol = float4( saturate( baseCol * texCol.rgb + additiveCol ), texCol.a ) * inVertexColour;",
     "\tfloat4 texCol = tex2D( texture0, rtShellUv + rtUv - inTexCoord0.xy, ddx( inTexCoord0.xy ), ddy( inTexCoord0.xy ) );\n"

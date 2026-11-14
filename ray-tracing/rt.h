@@ -159,7 +159,8 @@ int rt_dump_textures(const char *prefix);
 /* Shell layers: whether a terrain texture carries grass or moss (wumrt_surfaces.ini, keyed by
    the same hash). Returns 1 and fills out[0] = height and out[1] = blade density, both
    relative to the settings, if it does. */
-int rt_shell(u32 tex, float *out);
+int rt_shell(u32 tex, float *out);   /* 0 = no shells, 1 = grass/moss, 2 = moss on rock tops */
+void rt_set_moss_rock(float strength);   /* moss: moss on rock tops (0 = off) */
 /* Characters (wumrt_characters.ini, same hash): what a texture is on the worms. 0 = nothing,
    1 = skin, 2 = skin whose texture also holds the eyes, 3 = an eye. */
 int rt_char_kind(u32 tex);

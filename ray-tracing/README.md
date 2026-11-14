@@ -193,6 +193,7 @@ shell_width = 0.45    # radius of a blade's foot, in cells (at most 0.45)
 shell_shadow = 0      # 1 = the blades shade each other and the ground from the sun
 grass_wind = 0        # wind sway of the shells and the border tufts (0 = still, 1 = gentle)
 grass_patches = 0     # painted colour patches over the grass (0 = one flat green, 1 = full)
+moss_rock = 0         # short moss cushions on up-facing rock (0 = off)
 cloud_shadows = 0     # soft drifting cloud shadows, strength 0..1 (0 = off)
 cloud_scale = 160     # size of a cloud, world units
 cloud_speed = 6       # drift, world units a second
@@ -524,6 +525,19 @@ Known flaws: where grass meets another material it still ends in a step (the sca
 tufts, see below, lean out over it); the blade shadows are a shader test against the other
 blades, not traced (the tracer does not see the blades; they get the ground's traced light
 and shadow); edges are aliased like the rest of the game (no anti-aliasing).
+
+## Moss on rock tops
+
+`moss_rock` (strength, off by default): rock textures (`rock` in `wumrt_surfaces.ini`) get a
+short shell stack (8 layers at most, 0.3 of `shell_height`, 1.6 times the cell density). The
+terrain vertex program puts the world-up share of the normal into texture coordinate z (unused
+by the game); the shader keeps moss only where that is high (0.55 to 0.85) and a big soft
+noise allows, cuts the blades off at the mask's height (soft cushions thinning out to their
+edges) and tints them green; no wind, colour patches or blade glow there. Checked at 480x270
+on Apple Core Island: the layers draw and the up test works (with it turned round, moss covers
+the vertical cliff faces), but that level's rock has hardly any up-facing tops (they are
+grass), so there is little to see; not judged on a level with bare rock tops. Captures
+`captures/mossdebug_*_moss_rock.png`.
 
 ## Cloud shadows
 
