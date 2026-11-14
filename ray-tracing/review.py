@@ -6,7 +6,7 @@ only the rendering differs.
     python review.py kit NAME [--main]   snapshot this copy's build (or with --main: main's build, the main
                                          sandbox's patched CG and main's shaders) as a kit; settings always
                                          from the main sandbox's wumrt.ini
-    python review.py shoot MILESTONE [KIT ...] [--levels a,b] [--res 1280x720]
+    python review.py shoot MILESTONE [KIT ...] [--levels a,b] [--res WxH]
                                          shoot stock + the kits (default: baseline current) into
                                          main ray-tracing/captures/review/MILESTONE/
     python review.py label MILESTONE     side-by-side sheets (stock | kits) + compressed JPEGs
@@ -16,7 +16,7 @@ Presets:
   KIT       a kit made with `review.py kit NAME`: "baseline" (main before the streams merged) and
             "current" (latest main: `sh stream.sh sync review`, then `python review.py kit current`)
 
-How one level is shot: the review sandbox starts (1280x720 by default, scale 0.5, hide_hud = 1) with its
+How one level is shot: the review sandbox starts (480x270, the only size sandboxes may use; scale 1, hide_hud = 1) with its
 wumrt_textures pointing at an empty folder and the stock files in place; the match is paused
 (checked on screen); the views are set with the free camera; stock is shot; then textures are
 pointed back at the main sandbox's and reloaded, and for each kit its files are copied in and
@@ -298,7 +298,7 @@ def shoot(milestone, kits, levels, res):
     (folder / "notes.txt").write_text("\n".join(notes) + "\n")
 
 
-def smoke(milestone, kits, level, res=(1280, 720), timeout=300):
+def smoke(milestone, kits, level, res=(480, 270), timeout=300):
     """Start LEVEL with the last kit, let the match play until an explosion (fx_watch.py: fire-coloured
     pixels jump), which pauses it; then shoot the game's own view of that frozen moment with each kit
     (view "smoke"). No stock frame: textures cannot be taken out of a running game."""
@@ -437,7 +437,7 @@ def main():
     if a[0] == "kit" and len(a) in (2, 3):
         make_kit(a[1], from_main=a[2:] == ["--main"])
     elif a[0] == "shoot" and len(a) >= 2:
-        levels, res, kits = list(LEVELS), (1280, 720), []
+        levels, res, kits = list(LEVELS), (480, 270), []     # user 18:31: sandboxes at 480x270 only
         rest = a[2:]
         i = 0
         while i < len(rest):

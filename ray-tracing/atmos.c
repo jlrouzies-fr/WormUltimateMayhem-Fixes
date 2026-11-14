@@ -95,6 +95,7 @@ static struct {
     int failed;
     GLuint q[4][2]; int q_pending[4], q_next, q_made;
     double gpu_ms; u32 gpu_n, runs, frames;
+    float sun_uv[2]; int sun_on;
 } X;
 
 static int init(void)
@@ -157,6 +158,7 @@ void atmos_apply(GLuint scene, u32 w, u32 h, int rgba8)
     GLuint mask;
     u32 mw = 0, mh = 0, vw = 0, vh = 0;
     int k, c, sun_on = 0, a;
+    float sun_lum = 1.0f;
     GLint prev_unit = 0, prev_tex = 0;
     if (!S.on || !scene || !w || !h || (S.strength <= 0 && S.shafts <= 0)) return;
     if (!init()) return;
@@ -186,7 +188,10 @@ void atmos_apply(GLuint scene, u32 w, u32 h, int rgba8)
         }
         m = scol[0] > scol[1] ? scol[0] : scol[1]; if (scol[2] > m) m = scol[2];
         if (m <= 0) { scol[0] = 1; scol[1] = 0.9f; scol[2] = 0.75f; m = 1; }
+        sun_lum = 0.2126f * scol[0] + 0.7152f * scol[1] + 0.0722f * scol[2];
+        sun_lum = sun_lum / 0.6f > 1 ? 1 : sun_lum / 0.6f;         /* a dim (night) sun gives weak shafts */
         for (c = 0; c < 3; c++) scol[c] /= m;
+        X.sun_uv[0] = sun_uv[0]; X.sun_uv[1] = sun_uv[1]; X.sun_on = sun_on;
     }
 
     /* timer: read the oldest pair, start a new one */
@@ -218,7 +223,7 @@ void atmos_apply(GLuint scene, u32 w, u32 h, int rgba8)
         set4(p, "uAtmos", S.strength, S.start, S.range, S.height);
         set4(p, "uAtmos2", S.base, S.low, S.shafts, 0.05f);
         set4(p, "uSun", sun_uv[0], sun_uv[1], sun_on ? 1.0f : 0.0f, S.shaft_len);
-        set4(p, "uSunCol", scol[0], scol[1], scol[2], 0);
+        set4(p, "uSunCol", scol[0], scol[1], scol[2], sun_lum);
         set4(p, "uFallback", 0.55f, 0.65f, 0.8f, 0);
         G.BindImageTexture(0, scene, 0, GL_FALSE, 0, a == 0 ? GL_READ_ONLY : GL_READ_WRITE, rgba8 ? GL_RGBA8 : GL_RGBA16F);
         G.BindImageTexture(2, X.fog, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
@@ -248,9 +253,9 @@ void atmos_frame_end(void)
             glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, fog);
             glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
         }
-        rt_log("atmos: %u runs in %u frames; haze colour (linear) %.3f %.3f %.3f%s; GPU %.3f ms per run (%u timed)",
+        rt_log("atmos: %u runs in %u frames; haze colour (linear) %.3f %.3f %.3f%s; GPU %.3f ms per run (%u timed); sun on screen %d at %.2f %.2f",
                X.runs, X.frames, fog[0], fog[1], fog[2], fog[3] > 0.5f ? "" : " (fallback, no sky seen)",
-               X.gpu_n ? X.gpu_ms / X.gpu_n : 0.0, X.gpu_n);
+               X.gpu_n ? X.gpu_ms / X.gpu_n : 0.0, X.gpu_n, X.sun_on, X.sun_uv[0], X.sun_uv[1]);
     }
     X.frames = X.runs = X.gpu_n = 0; X.gpu_ms = 0;
 }

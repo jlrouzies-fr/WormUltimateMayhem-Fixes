@@ -198,12 +198,18 @@ class StartWatch(threading.Thread):
         return ok
 
 
+OFF_SCREEN = -10000     # x of the game window: off every monitor, so it can never be seen
+
+
 def tame(hwnd, w, h):
-    """Borderless, never activated, bottom of the Z order, client area w x h at 0,0."""
+    """Borderless, never activated, bottom of the Z order, client area w x h, OFF every screen.
+    It used to sit at 0,0 under everything, and showed whenever the window above it went away
+    (18:24 pop-up: a 1926x1109 window over the desktop). The game renders, is screenshotted and
+    takes injected keys the same off-screen (tested 18:42: 28 fps, normal frames)."""
     u32.SetWindowLongW(hwnd, GWL_STYLE, ctypes.c_long(WS_POPUP | WS_VISIBLE).value)
     ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
     u32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
-    u32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, w, h, SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    u32.SetWindowPos(hwnd, HWND_BOTTOM, OFF_SCREEN, 0, w, h, SWP_NOACTIVATE | SWP_FRAMECHANGED)
 
 
 def any_game_running():
@@ -347,6 +353,11 @@ def launch(extra):
         print(f"BUSY: the game slot is not {me}'s. Take it first: sh stream.sh slot take {me} [MIN] "
               f"(or join the queue: sh stream.sh slot queue {me}).", file=sys.stderr)
         sys.exit(3)
+    w, h = window_size()
+    if (w, h) != (480, 270) and os.environ.get("WUMRT_ALLOW_SIZE") != "1":
+        # user 18:30: "Keep many, 480x270 only" (a 1920x1080 start popped up at 18:24)
+        sys.exit(f"refused: Default.cfg asks for {w}x{h}; sandboxes start at 480x270 only "
+                 "(set /W:480 /H:270 in this sandbox's Default.cfg)")
     games = [Path(g) for g in any_game_running()]
     if any(g.resolve() == REAL_GAME.resolve() for g in games if g.exists()):
         sys.exit(f"the real game ({REAL_GAME}) is running; sandboxes never start beside it")

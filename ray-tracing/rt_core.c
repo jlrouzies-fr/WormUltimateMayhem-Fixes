@@ -633,7 +633,7 @@ static void load_characters(void)
         u32 h;
         if (sscanf(line, " %8x %15[a-z]", &h, kind) != 2) continue;
         char_tex[n_chars].hash = h;
-        char_tex[n_chars].kind = !strcmp(kind, "skin") ? 1 : !strcmp(kind, "face") ? 2 : !strcmp(kind, "eye") ? 3 : !strcmp(kind, "foliage") ? 4 : 0;
+        char_tex[n_chars].kind = !strcmp(kind, "skin") ? 1 : !strcmp(kind, "face") ? 2 : !strcmp(kind, "eye") ? 3 : !strcmp(kind, "foliage") ? 4 : !strcmp(kind, "accessory") ? 5 : 0;
         if (char_tex[n_chars].kind) n_chars++;
     }
     fclose(f);

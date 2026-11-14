@@ -165,6 +165,8 @@ static struct {
 /* ---- objects ------------------------------------------------------------------------- */
 #define MAXOBJ 512
 struct obj { u32 key; float model[16]; };
+#define MAXWORM 64
+struct wbox { float lo[3], hi[3]; };
 static struct {
     struct obj cur[MAXOBJ], prev[MAXOBJ];
     unsigned char taken[MAXOBJ];
@@ -175,7 +177,9 @@ static struct {
     GLint fbo, prog, vp[4], depth_func; GLboolean depth_mask, color_mask[4];
     int blend, depth_test, alpha_test, scissor, stencil;
     int active;
-    u32 dbg, applied_frame, after;
+    u32 dbg, applied_frame, after, fast;
+    struct wbox worm[MAXWORM], worm_prev[MAXWORM]; int nworm, nworm_prev;   /* worm bodies, this and last frame */
+    u32 worm_parts;                         /* rigid moving parts left out as worm-attached (log) */
 } O;
 
 static const char *VS =
@@ -343,6 +347,20 @@ int motion_object_begin(const struct rt_draw *d, const float *model, const float
     GLint vp[4];
     if (!motion_objects_wanted() || !d->v_on || !post_main_view()) return 0;
     if (g_state <= 0 || X.ctx != wglGetCurrentContext() || X.failed || X.ofailed) return 0;
+    {
+        /* A worm: its body is CPU-skinned (no model-matrix motion), and its rigid parts (hair, caps,
+           helmets, glasses) must not smear on their own while the body stays sharp. Worm textures
+           (wumrt_characters.ini: skin, face, eye, accessory) are never re-drawn, and the bodies
+           leave their boxes so that unlisted parts near a worm are left out too. */
+        int ck = rt_char_kind(d->texture);
+        if (ck != 0 && ck != 4) {
+            float lo[3], hi[3];
+            if ((ck == 1 || ck == 2) && O.nworm < MAXWORM && rt_draw_bounds(d, model, lo, hi)) {
+                memcpy(O.worm[O.nworm].lo, lo, 12); memcpy(O.worm[O.nworm].hi, hi, 12); O.nworm++;
+            }
+            return 0;
+        }
+    }
     key = draw_key(d);
     O.seen++;
     if (O.applied_frame == X.frame + 1) O.after++;     /* lit draws after the blur pass this frame */
@@ -359,6 +377,24 @@ int motion_object_begin(const struct rt_draw *d, const float *model, const float
     O.taken[bi] = 1;
     for (i = 0; i < 16; i++) { float e = fabsf(model[i] - best->model[i]); if (e > diff) diff = e; }
     if (diff < 1e-4f) return 0;                                          /* did not move */
+    {
+        /* near a worm body (this frame so far, or last frame): a worm's part */
+        /* margin: a held weapon or swung bat reaches beyond the body; last frame's boxes also by
+           how far the part itself moved */
+        float m = 16.0f;
+        int w, k, in;
+        for (w = 0; w < O.nworm + O.nworm_prev; w++) {
+            const struct wbox *b = w < O.nworm ? &O.worm[w] : &O.worm_prev[w - O.nworm];
+            m = w < O.nworm ? 16.0f : 16.0f + sqrtf(bd);
+            for (in = 1, k = 0; k < 3; k++) if (model[12 + k] < b->lo[k] - m || model[12 + k] > b->hi[k] + m) in = 0;
+            if (in) { O.worm_parts++; return 0; }
+        }
+    }
+    if (S.log && sqrtf(bd) > 2.0f && O.fast < 10) {                    /* a fast object: worth a look */
+        O.fast++;
+        rt_log("motion: fast object key %08x tex %u count %u moved %.1f units this frame, at %.0f %.0f %.0f",
+               key, d->texture, d->count, sqrtf(bd), model[12], model[13], model[14]);
+    }
     if (S.log >= 2 && O.dbg < 40) {
         O.dbg++;
         rt_log("motion: object key %08x tex %u count %u buf %u moved %.2f (largest matrix change %.4f), pos %.1f %.1f %.1f",
@@ -582,15 +618,17 @@ void motion_frame_end(void)
         memcpy(O.prev, O.cur, sizeof(struct obj) * (size_t)O.ncur);
         O.nprev = O.ncur; O.ncur = 0;
         memset(O.taken, 0, sizeof O.taken);
+        memcpy(O.worm_prev, O.worm, sizeof(struct wbox) * (size_t)O.nworm);
+        O.nworm_prev = O.nworm; O.nworm = 0;
     }
     X.frame++;
     if (!motion_wanted() || !S.log || g_state <= 0 || X.ctx != wglGetCurrentContext()) return;
     if (++X.frames < 300) return;
     rt_log("motion: %u blurred (%u with moving objects), %u still, %u cuts in %u frames; GPU %.3f ms per run (%u timed); "
-           "objects: %u lit draws seen (%u after the blur pass), %u velocity re-draws",
-           X.runs, X.obj_runs, X.still, X.cuts, X.frames, X.gpu_n ? X.gpu_ms / X.gpu_n : 0.0, X.gpu_n, O.seen, O.after, O.draws);
+           "objects: %u lit draws seen (%u after the blur pass), %u velocity re-draws, %u worm parts left out",
+           X.runs, X.obj_runs, X.still, X.cuts, X.frames, X.gpu_n ? X.gpu_ms / X.gpu_n : 0.0, X.gpu_n, O.seen, O.after, O.draws, O.worm_parts);
     X.frames = X.runs = X.obj_runs = X.still = X.cuts = X.gpu_n = 0; X.gpu_ms = 0;
-    O.seen = O.draws = 0; O.dbg = 0; O.after = 0;
+    O.seen = O.draws = 0; O.dbg = 0; O.after = 0; O.fast = 0; O.worm_parts = 0;
 }
 
 void motion_forget(void)

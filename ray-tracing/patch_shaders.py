@@ -553,6 +553,18 @@ void RtSkin( float4 rtChar, float4 rtChar2, sampler2D rtMask, sampler2D rtRefl, 
 		additiveCol = float3( trans, sky, rtSun );
 		return;
 	}
+	if ( rtChar.x > 4.5f )
+	{
+		// Accessories (caps, helmets, hair): no skin light, but the same sky-fed rim as the
+		// skin so the whole character reads as one shape, in a neutral colour, and a broad
+		// soft sheen of the sun
+		float rimA = pow( 1 - saturate( dot( n, v ) ), 3 ) * sky * ( 0.6f + 0.4f * saturate( dot( n, up ) + 0.5f ) );
+		float3 rimColA = lerp( lightAmbientCol * 1.2f, lightDiffuseCol * rtSun, behind );
+		baseCol += rimColA * ( rimA * rtChar.z );
+		float3 hA = normalize( l + v );
+		additiveCol += lightDiffuseCol * ( pow( saturate( dot( n, hA ) ), 12 ) * rtSun * 0.25f * rtChar.z );
+		return;
+	}
 	if ( rtChar.x > 3.5f )
 	{
 		// Foliage (leaves, bushes, grass and flower cut-outs). Sunlight through the leaf where
@@ -613,7 +625,7 @@ p.write_text(s, encoding="latin1", newline="")
 # ---- FixedFunction.cg: smoke puffs lit like soft volumes (wumrt.c sets rtSmoke for smoke only) ----
 # rtSmoke = (on, strength, texture step for the alpha slope, slope gain; negative flips v).
 # rtSmokeSun = (direction towards the sun in view space, x right, y up, z towards the eye; visibility).
-# rtSmokeSunCol = sun colour; rtSmokeAmb = (ambient colour, how much the underside keeps).
+# rtSmokeSunCol = (sun colour, debug split: only pixels left of this x are lit, 0 = all); rtSmokeAmb = (ambient colour, how much the underside keeps).
 # rtSmokeFx = (brightest effect light in view space, its radius), rtSmokeFxCol = (its power, z sign).
 # The puff's alpha slope gives a normal that bends out at its edges and along its billows, so
 # the sunny side is bright, the far side falls off softly and the underside is darker.
@@ -652,6 +664,7 @@ rep("""void FFFragmentMainTexCol(	float2 inTexCoord0 : TEXCOORD0,
 }""", """void FFFragmentMainTexCol(	float2 inTexCoord0 : TEXCOORD0,
 							float4 inCol : COLOR,
 							float3 inVPos : TEXCOORD1,
+							float4 inWPos : WPOS,
 							uniform sampler2D texture0,
 							uniform float4 rtSmoke,
 							uniform float4 rtSmokeSun,
@@ -662,7 +675,7 @@ rep("""void FFFragmentMainTexCol(	float2 inTexCoord0 : TEXCOORD0,
 							out float4 outCol : COLOR )
 {
 	outCol = tex2D( texture0, inTexCoord0 ) * inCol;
-	if ( rtSmoke.x > 0.5f )
+	if ( rtSmoke.x > 0.5f && ( rtSmokeSunCol.w <= 0 || inWPos.x < rtSmokeSunCol.w ) )
 	{
 		float d = rtSmoke.z;
 		float ax = tex2D( texture0, inTexCoord0 + float2( d, 0 ) ).a - tex2D( texture0, inTexCoord0 - float2( d, 0 ) ).a;
@@ -767,37 +780,44 @@ float4 RtWaterStyle( float4 rtWater, float4 rtR, float4 rtR0, float fres, float3
 	float k = rtWater.x;
 	// How bright the game paints its sea here (dark at night, bright by day)
 	float lum = dot( game, float3( 0.2126f, 0.7152f, 0.0722f ) );
-	float bright = clamp( lum / 0.32f, 0.15f, 1.6f );
-	float deep = 1 - exp( -d / 55.0f );
+	float bright = clamp( lum / 0.32f, 0.15f, 1.3f );
+	float deep = 1 - exp( -d / 32.0f );
 	float3 shallowC = float3( 0.22f, 0.86f, 0.80f );
 	float3 midC = float3( 0.05f, 0.52f, 0.72f );
-	float3 deepC = float3( 0.03f, 0.25f, 0.60f );
+	float3 deepC = float3( 0.04f, 0.28f, 0.60f );
 	float3 body = lerp( lerp( shallowC, midC, saturate( deep * 2 ) ), deepC, saturate( deep * 2 - 1 ) );
 	// Ripples shade the body a little (broad, not fine)
 	body *= 0.88f + 0.24f * saturate( nm.y * 0.5f + 0.5f );
 	body *= bright;
-	float3 c = lerp( lerp( game, body, saturate( k ) ), rtR.rgb, saturate( fres ) );
-	// Shore foam: chunky soft blobs from a slow, coarse sample of the ripple map, banded so that
-	// rings roll in towards the shore and fade out over about 6 units of depth.
+	// Dark (night, dusk) seas keep the game's own hue with the depth's light and dark: the bright
+	// palette only fully takes over where the game paints its sea bright (day)
+	float3 hue = game * ( dot( body, float3( 0.2126f, 0.7152f, 0.0722f ) ) / max( lum, 0.01f ) );
+	body = lerp( hue, body, smoothstep( 0.3f, 0.6f, lum ) );
+	// Less mirror than the game's Fresnel: on bright days the sky would hide the colours
+	float3 c = lerp( lerp( game, body, saturate( k ) ), rtR.rgb, saturate( fres ) * lerp( 1.0f, 0.6f, saturate( k ) ) );
+	// Shore foam: chunky soft blobs from a slow, coarse sample of the ripple map (its values sit
+	// near 0.5, so they are spread to 0..1 first), in rings that roll in towards the shore and
+	// thin out over about 10 units of depth, plus a broken rim right at the shore.
 	float n1 = tex2D( nmap, uv * 0.11f + time * float2( 0.011f, 0.007f ) ).r;
 	float n2 = tex2D( nmap, uv * 0.23f - time * float2( 0.006f, 0.013f ) ).g;
-	float blob = n1 * 0.6f + n2 * 0.4f;
-	float band = 0.5f + 0.5f * sin( h * 1.1f - time * 1.6f + blob * 4.0f );
-	float near = saturate( 1 - h / 14.0f );
-	float lip = saturate( 1 - h / 2.5f );                // solid rim right at the shore
-	float f = saturate( near * ( band * 0.7f + 0.25f ) + lip * 0.8f - 0.75f + blob * 0.6f );
-	f = smoothstep( 0.25f, 0.45f, f ) * ( d < 8000.0f ? 1.0f : 0.0f );
-	float3 foamC = float3( 0.93f, 0.98f, 1.0f ) * max( bright, 0.25f );
+	float blob = saturate( ( n1 * 0.6f + n2 * 0.4f - 0.38f ) * 4.0f );
+	float band = 0.5f + 0.5f * sin( h * 0.9f - time * 1.6f + blob * 3.0f );
+	float near = saturate( 1 - h / 10.0f );
+	float lip = saturate( 1 - h / 2.0f );
+	float f = smoothstep( 0.42f, 0.6f, near * near * ( 0.5f + 0.5f * band ) * ( 0.55f + 0.65f * blob ) );
+	f = max( f, smoothstep( 0.45f, 0.7f, lip + blob * 0.35f - 0.15f ) ) * ( d < 8000.0f ? 1.0f : 0.0f );
+	float3 foamC = float3( 1.0f, 1.0f, 1.0f ) * clamp( bright * 1.05f, 0.3f, 1.4f );
 	f *= saturate( k );
 	c = lerp( c, foamC, f );
 	// Sun glints on the ripples: a tight highlight of the sun, strong enough for bloom
 	float3 n = normalize( float3( nm.x * 0.55f, 1.0f, nm.y * 0.55f ) );
 	float3 hv = normalize( rtWater.yzw - eye );
-	float g = pow( saturate( dot( n, hv ) ), 900.0f );
+	float g = pow( saturate( dot( n, hv ) ), 2000.0f );
 	float day = saturate( rtWater.z * 4.0f ) * saturate( lum * 3.0f );
 	c += float3( 1.0f, 0.95f, 0.82f ) * g * 6.0f * k * day * ( 1 - f );
-	// a: foam is opaque; the clear shallows stay see-through as the game draws them
-	return float4( c, f );
+	// a: foam and deep water are opaque (the game's sea is see-through, and over open sea only
+	// a pale backdrop lies behind it); the clear shallows stay see-through to the seabed
+	return float4( c, max( f, saturate( deep * 1.3f ) * saturate( k ) ) );
 }
 
 """
@@ -893,6 +913,122 @@ if p.exists():
     # Stylised animated-film sea (water_style in wumrt.ini; rtWater = (strength, towards the sun)).
     s = s.replace("void WaterFragmentMain(", WATER_STYLE + "void WaterFragmentMain(", 1)
     p.write_text(s, encoding="latin1", newline="")
+
+# ---- matte-painting sky (wumrt.c sky_style; off = the game's shader) ----
+# The sky is drawn with the unlit FFFragmentMainTex. With rtSky.x > 0 (set by the harness for the
+# sky's own draws only) it becomes a clean painted gradient (the game's sky, softened, deeper and
+# more saturated overhead, lighter and warmer at the horizon), a soft sun disc with a corona, and
+# a layer of soft stylised clouds drifting slowly (value noise, 4 fixed octaves, no loops).
+SKY_FN = """
+// --- matte-painting sky (wumrt sky_style) --------------------------------------------
+// rtSky = (strength 0 = off, cloud amount, seconds, night 0..1); rtSkyR / rtSkyU = world direction
+// per unit of screen x / y (w = 2 / viewport width / height); rtSkyF = world direction at the screen
+// centre (w = viewport x); rtSkySun = direction towards the sun (w = disc strength); rtSkySunCol =
+// its colour (w = viewport y).
+float RtSkyHash( float2 p ) { return frac( sin( dot( p, float2( 127.1f, 311.7f ) ) ) * 43758.5453f ); }
+float RtSkyNoise( float2 p )
+{
+	float2 i = floor( p );
+	float2 f = frac( p );
+	f = f * f * ( 3 - 2 * f );
+	return lerp( lerp( RtSkyHash( i ), RtSkyHash( i + float2( 1, 0 ) ), f.x ),
+				 lerp( RtSkyHash( i + float2( 0, 1 ) ), RtSkyHash( i + float2( 1, 1 ) ), f.x ), f.y );
+}
+float3 RtSky( float3 base, float3 soft, float4 wpos, float4 rtSky, float4 rtSkyR, float4 rtSkyU, float4 rtSkyF,
+			  float4 rtSkySun, float4 rtSkySunCol )
+{
+	float2 ndc = ( wpos.xy - float2( rtSkyF.w, rtSkySunCol.w ) ) * float2( rtSkyR.w, rtSkyU.w ) - 1;
+	float3 d = normalize( rtSkyF.xyz + ndc.x * rtSkyR.xyz + ndc.y * rtSkyU.xyz );
+	float k = saturate( rtSky.x );
+	float night = rtSky.w;
+	float h = saturate( d.y );
+	// 1. clean: the game's painted sky with its fine detail softened
+	float3 c = lerp( base, soft, 0.3f );
+	float lum = dot( c, float3( 0.299f, 0.587f, 0.114f ) );
+	// 2. gradient: deeper and more saturated overhead, lighter and warmer near the horizon
+	float up = smoothstep( 0.0f, 0.55f, h );
+	float3 deep = max( lerp( float3( lum, lum, lum ), c, 1.4f ), 0 ) * lerp( 0.9f, 0.82f, night );
+	float3 sc = rtSkySunCol.rgb / max( max( rtSkySunCol.r, rtSkySunCol.g ), max( rtSkySunCol.b, 0.05f ) );
+	float3 warm = c * lerp( float3( 1, 1, 1 ), sc, 0.1f ) + sc * ( 0.035f * ( 1 - 0.75f * night ) );
+	float3 g = lerp( warm, deep, up );
+	// 3. clouds: soft rounded puffs on a dome, drifting slowly
+	float a = 0;
+	float3 cloud = g;
+	if ( rtSky.y > 0 && d.y > -0.05f )
+	{
+		float2 p = d.xz / ( h + 0.18f ) * 0.75f + rtSky.z * float2( 0.010f, 0.0045f );	// same heading as the cloud shadows (cloud_shadows: drift x, 0.45 x)
+		float n = 0.5f * RtSkyNoise( p ) + 0.25f * RtSkyNoise( p * 2.03f + 1.7f ) +
+				  0.125f * RtSkyNoise( p * 4.07f + 3.1f ) + 0.0625f * RtSkyNoise( p * 8.13f + 5.3f );
+		n *= 1.0667f;
+		float cover = 0.84f - 0.26f * rtSky.y;
+		a = smoothstep( cover, cover + 0.06f, n ) * smoothstep( 0.08f, 0.32f, h );
+		// thicker inside = shaded underside; lit from above and from the sun's side
+		float thick = saturate( ( n - cover ) * 3.5f );
+		float3 litCol = lerp( g, saturate( lum * 2.2f + 0.12f ) * float3( 1.0f, 0.98f, 0.95f ), 0.7f );
+		float3 shadeCol = lerp( g, litCol, 0.5f ) * float3( 0.9f, 0.92f, 1.0f );
+		cloud = lerp( litCol, shadeCol, thick * 0.7f );
+		float s = saturate( dot( d, rtSkySun.xyz ) );
+		cloud += rtSkySunCol.rgb * ( pow( s, 6.0f ) * 0.35f * ( 1 - thick ) ) * ( 1 - night );
+	}
+	float3 col = lerp( g, cloud, a * 0.75f );
+	// 4. the sun: a soft glowing disc and corona (smaller and cooler for the moon), behind the clouds
+	if ( rtSkySun.w > 0 )
+	{
+		float s = dot( d, rtSkySun.xyz );
+		float r = lerp( 0.99955f, 0.99972f, night );
+		float disc = smoothstep( r - 0.00035f, r, s );
+		float corona = pow( saturate( s ), 1200.0f ) * 0.25f + pow( saturate( s ), 60.0f ) * 0.04f * ( 1 - night );
+		float3 discCol = lerp( float3( 1.0f, 0.97f, 0.9f ), sc, 0.25f ) * lerp( 1.3f, 1.0f, night );
+		col += ( discCol * disc * ( 1 - a ) + sc * corona * ( 1 - 0.6f * a ) ) * rtSkySun.w;
+	}
+	return lerp( base, col, k );
+}
+
+"""
+p = cg / "FixedFunction.cg"
+s = p.read_text(encoding="latin1")
+rep("void FFFragmentMainTex(\tfloat2 inTexCoord0 : TEXCOORD0,\n"
+    "\t\t\t\t\t\tuniform sampler2D texture0,\n"
+    "\t\t\t\t\t\tout float4 outCol : COLOR )\n"
+    "{\n"
+    "\toutCol = tex2D( texture0, inTexCoord0 );\n"
+    "}\n",
+    SKY_FN +
+    "void FFFragmentMainTex(\tfloat2 inTexCoord0 : TEXCOORD0,\n"
+    "\t\t\t\t\t\tfloat4 inWPos : WPOS,\n"
+    "\t\t\t\t\t\tuniform sampler2D texture0,\n"
+    "\t\t\t\t\t\tuniform float4 rtSky,\n"
+    "\t\t\t\t\t\tuniform float4 rtSkyR,\n"
+    "\t\t\t\t\t\tuniform float4 rtSkyU,\n"
+    "\t\t\t\t\t\tuniform float4 rtSkyF,\n"
+    "\t\t\t\t\t\tuniform float4 rtSkySun,\n"
+    "\t\t\t\t\t\tuniform float4 rtSkySunCol,\n"
+    "\t\t\t\t\t\tout float4 outCol : COLOR )\n"
+    "{\n"
+    "\toutCol = tex2D( texture0, inTexCoord0 );\n"
+    "\tif ( rtSky.x > 0 )\n"
+    "\t\toutCol.rgb = RtSky( outCol.rgb, tex2Dbias( texture0, float4( inTexCoord0, 0, 2.5f ) ).rgb, inWPos, rtSky,\n"
+    "\t\t\t\t\t\t\trtSkyR, rtSkyU, rtSkyF, rtSkySun, rtSkySunCol );\n"
+    "}\n")
+# the sky's meshes are drawn with the vertex-coloured variant (also the smoke stream's lit smoke, above)
+rep("\t\t\t\t\t\t\tuniform float4 rtSmokeFxCol,\n"
+    "\t\t\t\t\t\t\tout float4 outCol : COLOR )\n",
+    "\t\t\t\t\t\t\tuniform float4 rtSmokeFxCol,\n"
+    "\t\t\t\t\t\t\tfloat4 inWPos : WPOS,\n"
+    "\t\t\t\t\t\t\tuniform float4 rtSky,\n"
+    "\t\t\t\t\t\t\tuniform float4 rtSkyR,\n"
+    "\t\t\t\t\t\t\tuniform float4 rtSkyU,\n"
+    "\t\t\t\t\t\t\tuniform float4 rtSkyF,\n"
+    "\t\t\t\t\t\t\tuniform float4 rtSkySun,\n"
+    "\t\t\t\t\t\t\tuniform float4 rtSkySunCol,\n"
+    "\t\t\t\t\t\t\tout float4 outCol : COLOR )\n")
+rep("\t\toutCol.rgb *= light * rtSmoke.y;\n\t}\n}",
+    "\t\toutCol.rgb *= light * rtSmoke.y;\n\t}\n"
+    "\tif ( rtSky.x > 0 )\n"
+    "\t\toutCol.rgb = RtSky( outCol.rgb, tex2Dbias( texture0, float4( inTexCoord0, 0, 2.5f ) ).rgb * inCol.rgb, inWPos,\n"
+    "\t\t\t\t\t\t\trtSky, rtSkyR, rtSkyU, rtSkyF, rtSkySun, rtSkySunCol );\n"
+    "}")
+p.write_text(s, encoding="latin1", newline="")
 
 # ---- HDR for the film post-processing (post.c, hdr = 1 in wumrt.ini) ----
 # The lit shaders clamp their colour to 0..1. Into the game's 8-bit scene texture the hardware

@@ -32,7 +32,7 @@ uniform vec3 uDy;
 uniform vec4 uAtmos;    // strength (most haze), start distance, distance scale, height scale
 uniform vec4 uAtmos2;   // base height, how much height matters (0..1), shafts strength, time smoothing
 uniform vec4 uSun;      // sun uv, on (1/0), shaft length (share of the way to the sun)
-uniform vec4 uSunCol;   // sun colour (max 1), fallback weight
+uniform vec4 uSunCol;   // sun colour (max 1), the sun's brightness (0..1: dim at night)
 uniform vec4 uFallback; // haze colour when no sky has been seen yet (linear)
 
 layout(binding = 1) uniform sampler2D uMaskTex;
@@ -114,19 +114,26 @@ void main()
         changed = true;
     }
     if (uAtmos2.z > 0.0 && uSun.z > 0.5) {
-        // sun shafts: how much open sky lies between this pixel and the sun on screen
+        // Sun shafts: a radial blur of "open sky" towards the sun's place on screen. Light
+        // through gaps between terrain, trees and worms streaks away from the sun; where the
+        // line to the sun is blocked there is none. 24 taps, jittered per pixel (interleaved
+        // gradient noise) so the steps do not band; nearer taps count more.
         vec2 to = (uSun.xy - uv) * uSun.w;
-        float open = 0.0;
-        for (int k = 0; k < 16; k++) {
-            vec2 q = uv + to * ((float(k) + 0.5) / 16.0);
-            if (q.x > 0.0 && q.x < 1.0 && q.y > 0.0 && q.y < 1.0 && isSky(maskDist(q))) open += 1.0;
+        float j = fract(52.9829189 * fract(dot(vec2(p), vec2(0.06711056, 0.00583715))));
+        float open = 0.0, wsum = 0.0;
+        for (int k = 0; k < 24; k++) {
+            float t = (float(k) + j) / 24.0;
+            vec2 q = uv + to * t;
+            float w = 1.0 - 0.5 * t;
+            if (q.x > 0.0 && q.x < 1.0 && q.y > 0.0 && q.y < 1.0 && isSky(maskDist(q))) open += w;
+            wsum += w;
         }
-        open /= 16.0;
+        open /= wsum;
         vec2 ds = (uv - uSun.xy) * vec2(uSize.x * uSize.w, 1.0);
-        float fall = exp(-dot(ds, ds) * 6.0);
-        // only where the line to the sun is partly blocked: shafts, not a flat glow
-        float shaft = open * (1.0 - open) * 4.0 * fall;
-        c += uSunCol.rgb * haze * uAtmos2.z * shaft;
+        float fall = exp(-dot(ds, ds) * 3.0);
+        // over open sky the sun's own glare (post.c) and disc (sky stream) are already there
+        float shaft = open * fall * (sky ? 0.3 : 1.0);
+        c += uSunCol.rgb * (uSunCol.w * uAtmos2.z * 0.6 * shaft);
         changed = true;
     }
     if (changed) imageStore(uScene, p, vec4(toGamma(c), src.a));

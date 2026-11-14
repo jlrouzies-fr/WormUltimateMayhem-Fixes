@@ -664,7 +664,7 @@ void main()
             // radius at its nearest point would), fading out within uChar.w of its surface,
             // darkens all of the point's sky light, twice over: stylised and free of noise, so
             // the worms sit on the ground. Not on the characters themselves.
-            if (uChar.z != 0.0 && uNCaps > 0 && (mats[2 * int(pLayer)].w < 0.5 || mats[2 * int(pLayer)].w > 3.5)) {
+            if (uChar.z != 0.0 && uNCaps > 0 && (mats[2 * int(pLayer)].w < 0.5 || (mats[2 * int(pLayer)].w > 3.5 && mats[2 * int(pLayer)].w < 4.5))) {
                 float keep = 1.0;
                 for (int k = 0; k < 16; k++) {
                     if (k >= uNCaps) break;

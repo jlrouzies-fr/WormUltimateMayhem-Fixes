@@ -365,7 +365,7 @@ every preset of a level in the same paused match so only the rendering differs:
 ```
 python review.py kit baseline|current       # snapshot this copy's build: core, patched CG, compute shaders,
                                             # ini files, settings from the main sandbox's wumrt.ini
-python review.py shoot MILESTONE [KITS]     # 1280x720, scale 0.5; into captures/review/MILESTONE/
+python review.py shoot MILESTONE [KITS]     # 480x270 (the only allowed size); into captures/review/MILESTONE/
 python review.py label MILESTONE            # side-by-side sheets with captions
 python review.py gallery MILESTONE "LABEL"  # compressed images + gallery.json for the gallery page
 python review.py smoke MILESTONE LEVEL KITS # play until an explosion (fx_watch.py --log GLOW with
@@ -641,6 +641,15 @@ worms' face draws every 3 s (`characters: N faces at (x y z) ...` in `wumrt.log`
 shoots six angles into one sheet; `lookat.py faces` lists the logged worms and `lookat.py face N
 ANGLE DIST ...` aims at worm N). Worms are about 30 world units tall. The pause menu box
 covers the middle of the frame, so SHIFT turns the view to put the worm beside it.
+
+Accessories (`accessory` in `wumrt_characters.ini`: a cap, a helmet, afro and beard hair so far)
+get no skin light. They get the same sky-fed rim as the skin (`rim_light`), in a neutral colour,
+so a worm and its hat read as one shape, plus a broad soft sheen of the sun. They are not
+receivers of the contact shadow. The sunglasses lens (`6893ed77`) is left out because its
+texture also covers some worms' chins. Judged with smooth normals on, on a night level (Grave
+Danger: `captures/char_night4_pair.png`) and in a fireball's light (`fx_test = 1500` beside the
+worm: `captures/char_fx4_pair.png`). Skin stays warm and fleshy in both, and the cap keeps its
+rim instead of taking skin light.
 
 Foliage uses the same path. Textures labelled `foliage` in `wumrt_characters.ini` (leaf, plant,
 grass and flower cut-outs, the tree canopies' leaves) are kind 4. Where such a surface faces
@@ -1098,9 +1107,21 @@ The game draws its smoke puffs as unlit, alpha-blended sprites (`FFVertexMainTex
 | `smoke_gain` | 6 | alpha slope -> normal tilt (negative flips the texture's v) |
 | `smoke_under` | 0.55 | ambient the underside keeps |
 | `smoke_sun`, `smoke_ambient` | 1, 1 | scales of the sun and the ambient part |
+| `smoke_fx` | 1 | scale of the brightest effect light (fx.c) on the smoke, inverse-square |
+| `smoke_split` | 0 | debug: lit only left of this share of the width (same-frame A/B) |
 
-Limits: no shadow on the puff (it takes the sun as seen from the open sky), no light from
-explosions on the smoke yet, no traced shadow cast by the smoke.
+Limits: no shadow on the puff (it takes the sun as seen from the open sky), no traced shadow
+cast by the smoke.
+
+**Status (18:48): NOT WORKING in game, keep `smoke = 0`.** The harness does mark the explosion
+puffs (textures averaging white, alpha 0.31 / 0.57: `smoke: lit N smoke draws ... textures`
+lines in wumrt.log, about 140 a second while puffs are on screen), but the puffs look the same:
+`smoke_strength = 0.2` changed nothing, and a debug build of the branch that paints it red did
+not show red either (both after a live `cg-reload`; not re-tested after a fresh start). So the
+lit branch does not run in the program that draws them; the cause is not found (suspects: the
+uniforms do not reach the bound gp4 program, or the particles are drawn by another program
+object than the one the harness sees as bound). The patched shaders compile with the game's
+cg.dll (gp4vp/gp4fp) and selftests pass with smoke = 1.
 
 ## Atmospheric depth
 
@@ -1122,9 +1143,14 @@ How it works:
 Pixels with no hit (sky, and the sea, which is not in the traced scene) are left alone. Labels
 and particles over a surface take that surface's haze.
 
-Optional sun shafts (`atmos_shafts`, off) count the open sky on 16 taps towards the sun's place
-on screen and add sun-coloured light where that line is partly blocked. Not judged yet: the sun
-was never on screen in the test views.
+Sun shafts (`atmos_shafts`) are a radial blur of "open sky" towards the sun's place on screen:
+24 taps per pixel, jittered so the steps don't band, with the nearer taps counting more. Light
+through gaps between terrain, trees and worms streaks away from the sun, and none falls where
+the line to the sun is blocked. Over open sky the shafts are 0.3 as strong, because post.c's
+glare and the sky stream's sun disc already cover that. A dim (night) sun gives weak shafts.
+They show when the sun is on screen behind something; the game camera mostly looks down, so in
+play that is mostly with the free camera or low suns. Judged on Apple Core at sunset and a
+daytime town level: 1 is visible but restrained, 2 is strong.
 
 Settings (world units: a worm is about 25 tall, a level about +-600):
 
@@ -1136,17 +1162,24 @@ atmos_range = 500     # distance scale of the build-up
 atmos_height = 250    # the haze thins over this much above atmos_base
 atmos_base = 0
 atmos_low = 0.6       # how much the height matters (0 = distance only)
-atmos_shafts = 0      # sun shafts strength (experimental)
+atmos_shafts = 0      # sun shafts strength (1 = judged good; main ini uses 1)
 atmos_shaft_len = 0.5 # share of the way to the sun the shaft taps cover
 atmos_log = 0         # 1 = log the haze colour and the GPU time every 300 frames
 ```
 
-Cost (480x270, timestamp queries): 0.01-0.06 ms GPU per frame. Every loop has a constant bound
-(4 + 64 sky samples, 16 shaft taps).
+Cost (480x270, timestamp queries): 0.01-0.06 ms GPU per frame without shafts, up to 0.2 ms with
+them. Every loop has a constant bound (4 x 64 sky samples, 24 shaft taps).
 
-Captures: `captures/atmos_apple_core_night_480.png`, `captures/atmos_random_level_day_480.png`
-(off / on / 0.7). Tested from a free camera pulled back 350 units and raised 150 units.
-`atmos_test.sh NAME` runs the batch.
+Captures (480x270):
+- `captures/atmos_game_camera_apple_480.png` and `atmos_game_camera_town_480.png`: the game's
+  own camera, off / on.
+- `atmos_apple_core_night_480.png` and `atmos_random_level_day_480.png`: from a free camera
+  pulled back over the level, off / 0.5 / 0.7.
+- `atmos_shafts_apple_sunset_480.png` and `atmos_shafts_town_day_480.png`: shafts 0 / 1 / 2,
+  from the level's far side towards the sun.
+
+`atmos_test.sh NAME` runs the haze batch. `shafts_test.sh NAME` runs the shafts batch, with
+`sun_view.py DYAW DPITCH [DIST HEIGHT]` aiming the free camera at the sun.
 
 ## Camera motion blur
 
@@ -1305,6 +1338,33 @@ the menu automation added only one team; the driver-compressed 2048 run reached 
 The flag is only set on a sandbox's exe copy (`texmem.py laa on`); `install.py` does not set
 it on the real game, and nothing here touches the real exe.
 
+## Matte-painting sky
+
+```
+sky_style = 0       # 0..1: the sky as an animated-film matte painting (0 = the game's own sky, the default)
+sky_clouds = 0.5    # 0..1: how much of the sky the soft drifting clouds cover (0 = none)
+sky_sun = 1         # strength of the soft sun disc and corona drawn into the sky (0 = none)
+```
+
+The game draws its sky with the unlit `FFVertexMainTex` + `FFFragmentMainTex` programs (meshes larger
+than 4000 units, drawn between the shadow pass and the first lit draw). `patch_shaders.py` gives
+`FFFragmentMainTex` six extra uniforms (`rtSky*`); `wumrt.c` (`sky_uniforms`) sets them only for those
+sky draws in the main view and puts `rtSky` back to 0 before anything else is drawn with the program
+(HUD, effects, and the sky's copies in the traced sky views), so with `sky_style = 0` or for any other draw
+the shader is the game's own. With it on, each sky pixel finds its world view direction from its screen
+position (`WPOS`, the sky view's matrices, the viewport) and:
+
+1. softens the game's painted sky (60% of a blurrier mip level), so it reads as a clean painted gradient;
+2. grades it by elevation: deeper and more saturated overhead, lighter and a little warmer near the horizon;
+3. adds soft rounded clouds on a dome: 4 fixed octaves of value noise, a soft threshold, shaded thicker
+   in the middle and lit towards the sun, drifting slowly (the harness clock); none below the horizon;
+4. adds a soft sun disc and corona in the traced sun's direction (`rt_stats.sun`, the shadow pass's
+   direction), behind the clouds; smaller and cooler when the light is dim or blue (night: the moon).
+
+The film post's `glare` still draws its halo at the same sun position. Atmospheric depth (`atmos`) averages
+the sky pixels it sees, so its fade colour follows this sky. The traced sky light (`gi`) still reads the
+game's own sky (the sky views are drawn with `rtSky = 0`), so lighting is unchanged by this setting; the
+painted sky is only a little deeper overhead than the light it gives.
 ## Stylised sea
 
 `water_style = 1` (0 = off, the default) turns the game's sea into animated-film water. It needs
@@ -1314,21 +1374,35 @@ the terrain (`rtRefl.a = 1 + distance`, 8192 where it hits nothing; `wumrt_trace
 patched `water.cg` (`RtWaterStyle`, from `patch_shaders.py`) uses it for:
 
 - **depth colour**: turquoise in the shallows, a saturated mid blue, then deep blue
-  (1/e at 28 world units along the view ray; a worm is about 15 tall). The traced mirror image
-  still goes on top with the same Fresnel blend as before.
-- **shore foam**: a soft band of chunky blobs (two slow, coarse samples of the game's ripple map)
-  where the water is less than about 6 units deep straight down, with rings rolling in towards
-  the shore and a solid lip in the last unit. Nothing at all where the ray met no seabed.
+  (1/e at 32 world units along the view ray; a worm is about 15 tall). The traced mirror image
+  goes on top at 0.6 of the game's Fresnel blend (more would hide the colours under a bright
+  sky). The game draws its sea see-through, and over open sea only a pale backdrop lies behind
+  it, so the stylised sea turns opaque with depth: clear shallows over the seabed, solid deep
+  water.
+- **night and dusk**: the bright palette fully applies only where the game paints its sea bright
+  (day). Darker seas keep the game's own hue (Grave Danger's teal, Apple Core's purple) with the
+  depth's light and dark and the foam.
+- **shore foam**: chunky blobs (two slow, coarse samples of the game's ripple map, spread to
+  0..1) in rings rolling in towards the shore over about 10 units of depth straight down, plus a
+  broken rim in the last 2 units. Opaque. Nothing where the ray met no seabed.
 - **sun glints**: a tight sun highlight on the ripple normals, up to 6x the sun's brightness
   so the film post's bloom picks it up (`hdr = 1`); none when the sun is low or the game paints
   its sea dark.
 
 Everything is scaled by how bright the game itself paints its sea at that pixel, so night
-levels stay dark. The value of `water_style` (0..1) blends the body colour between the game's
+levels stay dark. Judged at 480x270 on This Game Does Dragon (day), Grave Danger (night) and
+Apple Core Island (dusk). A thin green line in the water off some shores (Dragon) is the
+seabed's outer edge seen through the shallows; it is there with `water_style = 0` too.
+Live tuning tip: `rt.py reload` takes about 10 s before a changed `water_style` shows (the
+compute shaders compile first). The value of `water_style` (0..1) blends the body colour between the game's
 and the stylised one; foam and glints scale with it too. The engine sees the new uniform
 `rtWater` (= strength, direction towards the sun) hidden like the other rt uniforms; the C side
 is `water_style` in `wumrt.c` and `rt_water_sun()` in `rt_core.c`. Not done: caustics on the
-shallow seabed (would need the sea height in `Landscape.cg`).
+shallow seabed. A way in: a terrain pixel under the sea finds `rtRefl.a > 0.5` at its own
+pixel (= 1 + how deep it lies along the ray), so `Landscape.cg` could add a moving pattern
+there; it needs a time input on every terrain draw (`rtWind.x` is only set in the grass pass).
+Also noticed: `RtLight` adds `rtRefl.rgb` as glossy reflection, so terrain under the sea gets
+the sea's mirror image added (pre-existing, slight wash in the shallows).
 ## Cut-face edges (sculpted soil lips)
 
 Explosions cut the landscape into hard walls. The game draws those cut faces with the same

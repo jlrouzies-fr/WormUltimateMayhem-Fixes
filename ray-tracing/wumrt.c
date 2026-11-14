@@ -141,6 +141,8 @@ struct prog {
     void *p_rt_relief;               /* lit fragment programs: the parallax relief uniform */
     void *p_rt_smoke[6];             /* FFFragmentMainTexCol: lit smoke uniforms (see smoke_draw) */
     int smoke_last;                  /* rtSmoke was left on */
+    void *p_sky[6];                  /* FFFragmentMainTex: rtSky, rtSkyR, rtSkyU, rtSkyF, rtSkySun, rtSkySunCol */
+    int sky_last;                    /* rtSky was left non-zero */
     void *p_rt_wind;                 /* terrain fragment programs: wind and colour patches on the grass */
     void *p_rt_water;                /* the sea's fragment program: stylised water (water_style) and the sun */
     void *p_rt_blade;                /* terrain fragment programs: backlit blades (characters stream) */
@@ -268,6 +270,12 @@ static void setup_program(struct prog *p, const struct cg_record *r)
             if (!p->p_rt_smoke[1] || !p->p_rt_smoke[2] || !p->p_rt_smoke[3]) p->p_rt_smoke[0] = NULL;
             p->p_rt_water = p_cgGetNamedParameter(h, "rtWater");
             p->p_rt_blade = p_cgGetNamedParameter(h, "rtBlade");
+            {
+                static const char *sky_names[6] = { "rtSky", "rtSkyR", "rtSkyU", "rtSkyF", "rtSkySun", "rtSkySunCol" };
+                int k;
+                for (k = 0; k < 6; k++) p->p_sky[k] = p_cgGetNamedParameter(h, sky_names[k]);
+                if (!p->p_sky[5]) p->p_sky[0] = NULL;
+            }
         }
         if (p_cgGetNamedParameter) {
             p->p_rt_shell = p_cgGetNamedParameter(h, "rtShell");
@@ -278,7 +286,7 @@ static void setup_program(struct prog *p, const struct cg_record *r)
 /* Hide this program's extra uniforms from the engine's parameter walks. */
 static void add_rt_params(const struct prog *p)
 {
-    void *h[20];
+    void *h[26];
     int i;
     h[8] = p->p_rt_char; h[9] = p->p_rt_char2;
     h[0] = p->p_rt_normal; h[1] = p->p_rt_params3; h[2] = p->p_rt_refl; h[3] = p->p_rt_bounce;
@@ -286,7 +294,8 @@ static void add_rt_params(const struct prog *p)
     h[10] = p->p_rt_relief; h[11] = p->p_rt_wind; h[12] = p->p_rt_water; h[13] = p->p_rt_blade;
     h[14] = p->p_rt_smoke[0]; h[15] = p->p_rt_smoke[1]; h[16] = p->p_rt_smoke[2]; h[17] = p->p_rt_smoke[3];
     h[18] = p->p_rt_smoke[4]; h[19] = p->p_rt_smoke[5];
-    for (i = 0; i < 20; i++)
+    for (i = 0; i < 6; i++) h[20 + i] = p->p_sky[i];
+    for (i = 0; i < 26; i++)
         if (h[i] && n_rt_param_handles < MAX_RT_PARAMS) rt_param_handles[n_rt_param_handles++] = h[i];
 }
 
@@ -1007,6 +1016,61 @@ static int smooth_on = 1;           /* correct the traced light for smooth-shade
    through thin parts and the catchlights in the eyes; 0 = off. */
 static float char_wrap, char_rim, char_trans, char_catch;
 static float leaf_glow, leaf_wrap;      /* foliage (kind 4): light through leaves, soft wrap */
+static float sky_style, sky_clouds = 0.5f, sky_sun = 1.0f;   /* matte-painting sky (0 = off), cloud amount, sun disc */
+static float sky_sun_col[3] = { 1.0f, 0.9f, 0.75f };          /* the sun's colour, last given to the terrain */
+
+/* The matte-painting sky (sky_style): the sky's unlit fragment program (FFFragmentMainTex, edited by
+   patch_shaders.py) gets rtSky = (strength, cloud amount, seconds, night 0..1), the world direction per
+   unit of screen x and y (w = 2 / viewport size), the direction at the screen centre (w = viewport x),
+   the direction towards the sun (w = disc strength) and its colour (w = viewport y). Only the sky's own
+   draws in the main view get it; everything else drawn with that program (and the sky's copies in the
+   traced sky views) gets rtSky = 0, the game's own shader. */
+static void sky_uniforms(struct prog *vp, struct prog *fp, int on)
+{
+    float *V, *P, r[4], u[4], f[4], sun[4], col[4], t, lum, night;
+    GLint vpt[4] = { 0, 0, 1, 1 };
+    if (!fp || !fp->p_sky[0]) return;
+    if (!on) {
+        if (!fp->sky_last) return;
+        real_cgGLSetParameter4f(fp->p_sky[0], 0.0f, 0.0f, 0.0f, 0.0f);
+        (*(void (__cdecl **)(void *))IAT_cgUpdateProgramParameters)(fp->h);
+        fp->sky_last = 0;
+        return;
+    }
+    V = vp->view; P = vp->proj;
+    if (fabsf(P[0]) < 1e-6f || fabsf(P[5]) < 1e-6f || fabsf(P[11]) < 1e-6f) return;
+    glGetIntegerv(GL_VIEWPORT, vpt);
+    if (vpt[2] <= 0 || vpt[3] <= 0) return;
+    /* eye = world * V (row vectors); a direction in eye space (x, y, z) is x*col0 + y*col1 + z*col2 in the world.
+       Screen point (sx, sy) in -1..1: eye direction ((sx - P20/P23) / P00, (sy - P21/P23) / P11, 1 / P23). */
+    {
+        float ex = 1.0f / P[0], ey = 1.0f / P[5], ez = 1.0f / P[11];
+        float ox = -P[8] * ez * ex, oy = -P[9] * ez * ey;
+        int i;
+        for (i = 0; i < 3; i++) {
+            r[i] = V[i * 4 + 0] * ex;
+            u[i] = V[i * 4 + 1] * ey;
+            f[i] = V[i * 4 + 2] * ez + V[i * 4 + 0] * ox + V[i * 4 + 1] * oy;
+        }
+    }
+    r[3] = 2.0f / (float)vpt[2]; u[3] = 2.0f / (float)vpt[3]; f[3] = (float)vpt[0];
+    memcpy(sun, rt_stats.sun, 12);
+    sun[3] = (sun[0] != 0 || sun[1] != 0 || sun[2] != 0) ? sky_sun : 0.0f;
+    memcpy(col, sky_sun_col, 12); col[3] = (float)vpt[1];
+    /* night: a dim or blue light (the moon) */
+    lum = 0.3f * col[0] + 0.59f * col[1] + 0.11f * col[2];
+    night = (col[2] - col[0] - 0.1f) * 4.0f + (0.45f - lum) * 2.0f;
+    night = night < 0 ? 0 : night > 1 ? 1 : night;
+    t = (float)(GetTickCount() % 2000000u) * 0.001f;
+    real_cgGLSetParameter4f(fp->p_sky[0], sky_style, sky_clouds, t, night);
+    real_cgGLSetParameter4f(fp->p_sky[1], r[0], r[1], r[2], r[3]);
+    real_cgGLSetParameter4f(fp->p_sky[2], u[0], u[1], u[2], u[3]);
+    real_cgGLSetParameter4f(fp->p_sky[3], f[0], f[1], f[2], f[3]);
+    real_cgGLSetParameter4f(fp->p_sky[4], sun[0], sun[1], sun[2], sun[3]);
+    real_cgGLSetParameter4f(fp->p_sky[5], col[0], col[1], col[2], col[3]);
+    (*(void (__cdecl **)(void *))IAT_cgUpdateProgramParameters)(fp->h);
+    fp->sky_last = 1;
+}
 
 /* Where the worms are: the centres of their face draws (world space), logged every few seconds
    so that a free camera can be aimed at one (lookat.py). */
@@ -1174,11 +1238,11 @@ static float shell_ground[4];             /* rtShell of the game's own grass dra
    Settings: smoke (0/1), smoke_strength, smoke_step (texture step of the slope),
    smoke_gain (slope -> normal; negative flips v), smoke_under (what the underside keeps),
    smoke_sun, smoke_ambient (scales of the two lights). */
-static struct { int on; float strength, step, gain, under, sun, amb, fx; } SM;
+static struct { int on; float strength, step, gain, under, sun, amb, fx, split; } SM;
 static float smoke_sun_rgb[3] = { 1, 1, 1 }, smoke_amb_rgb[3] = { 0.4f, 0.4f, 0.4f };
 static void smoke_settings_begin(void)
 {
-    SM.on = 0; SM.strength = 1.0f; SM.step = 1.0f / 32.0f; SM.gain = 6.0f; SM.under = 0.55f; SM.sun = 1.0f; SM.amb = 1.0f; SM.fx = 1.0f;
+    SM.on = 0; SM.strength = 1.0f; SM.step = 1.0f / 32.0f; SM.gain = 6.0f; SM.under = 0.55f; SM.sun = 1.0f; SM.amb = 1.0f; SM.fx = 1.0f; SM.split = 0;
 }
 static void smoke_setting(const char *name, float v)
 {
@@ -1190,12 +1254,33 @@ static void smoke_setting(const char *name, float v)
     else if (!strcmp(name, "smoke_sun")) SM.sun = v;
     else if (!strcmp(name, "smoke_ambient")) SM.amb = v;
     else if (!strcmp(name, "smoke_fx")) SM.fx = v;
+    else if (!strcmp(name, "smoke_split")) SM.split = v;     /* debug: lit only left of this share of the width */
+}
+static float smoke_split_x(void)
+{
+    GLint vpt[4] = { 0, 0, 0, 0 };
+    if (SM.split <= 0) return 0;
+    glGetIntegerv(GL_VIEWPORT, vpt);
+    return (float)vpt[0] + SM.split * (float)vpt[2];
 }
 static void smoke_draw(struct prog *vp, struct prog *fp)
 {
     int on = SM.on && vp && vp->unlit_tex && (vp->have & 2) && gs.blend &&
              gs.blend_src == 0x0302 && gs.blend_dst == 0x0303 && rt_is_main_view(vp->view) && fx_smoke_texture(fp->tex0);
     if (!on && !fp->smoke_last) return;
+    if (on) {
+        static DWORD last_log;
+        static u32 n_lit, texs[8], ntex;
+        u32 t;
+        n_lit++;
+        for (t = 0; t < ntex && texs[t] != fp->tex0; t++) ;
+        if (t == ntex && ntex < 8) texs[ntex++] = fp->tex0;
+        if (GetTickCount() - last_log > 1000) {       /* "smoke: lit" lines: tools can wait for a puff on screen */
+            rt_log("smoke: lit %u smoke draws since the last line, textures %u %u %u %u", n_lit,
+                   texs[0], ntex > 1 ? texs[1] : 0, ntex > 2 ? texs[2] : 0, ntex > 3 ? texs[3] : 0);
+            last_log = GetTickCount(); n_lit = 0; ntex = 0;
+        }
+    }
     if (on) {
         /* the direction towards the sun, in view space (row vectors: v * view) */
         const float *s = rt_stats.sun, *m = vp->view;
@@ -1207,7 +1292,7 @@ static void smoke_draw(struct prog *vp, struct prog *fp)
         if (len > 1e-6f) { l[0] /= len; l[1] /= len; l[2] /= len; }
         real_cgGLSetParameter4f(fp->p_rt_smoke[0], 1.0f, SM.strength, SM.step, SM.gain);
         real_cgGLSetParameter4f(fp->p_rt_smoke[1], l[0], l[1], l[2], 1.0f);
-        real_cgGLSetParameter4f(fp->p_rt_smoke[2], smoke_sun_rgb[0] * SM.sun, smoke_sun_rgb[1] * SM.sun, smoke_sun_rgb[2] * SM.sun, 0);
+        real_cgGLSetParameter4f(fp->p_rt_smoke[2], smoke_sun_rgb[0] * SM.sun, smoke_sun_rgb[1] * SM.sun, smoke_sun_rgb[2] * SM.sun, smoke_split_x());
         real_cgGLSetParameter4f(fp->p_rt_smoke[3], smoke_amb_rgb[0] * SM.amb, smoke_amb_rgb[1] * SM.amb, smoke_amb_rgb[2] * SM.amb, SM.under);
         if (fp->p_rt_smoke[4] && fp->p_rt_smoke[5]) {
             /* the brightest explosion/fire light (fx.c), in view space */
@@ -1248,6 +1333,7 @@ static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum ityp
     }
     if (caster) sky_phase = 1;
     else if (lit) sky_phase = 0;
+    if (fp && fp->sky_last) sky_uniforms(vp, fp, 0);
     else if (vp && kind <= 2) {
         if (vp->water && (vp->have & 1)) rt_set_water(vp->model[13]);
         if (vp->water && FC->on) fc_water(vp);
@@ -1296,6 +1382,12 @@ static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum ityp
             d.v_type = gs.vtx.type; d.v_ptr = gs.vtx.ptr;
             if (rt_mesh_extent(&d) > 4000.0f) capture_sky(vp, kind, mode, first, count, itype, indices);
         }
+        if (sky_style > 0 && sky_phase && vp->unlit_tex && fp && fp->p_sky[0] && (vp->have & 6) == 6) {
+            memset(&d, 0, sizeof d);
+            d.v_on = gs.vtx_on; d.v_size = gs.vtx.size; d.v_stride = gs.vtx.stride; d.v_buf = gs.vtx.buf;
+            d.v_type = gs.vtx.type; d.v_ptr = gs.vtx.ptr;
+            if (rt_mesh_extent(&d) > 4000.0f) sky_uniforms(vp, fp, 1);
+        }
     }
     if (kind > 2 || !(caster || lit)) {
         if (!fp || !fp->p_rt_params || fp->rt_last == 0) return;
@@ -1334,6 +1426,7 @@ static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum ityp
         if (lit && vp->landscape && fp && (fp->have & 0x180) == 0x180) {
             rt_set_light(fp->dif, fp->amb);
             memcpy(smoke_sun_rgb, fp->dif, 12); memcpy(smoke_amb_rgb, fp->amb, 12);
+            memcpy(sky_sun_col, fp->dif, 12);
         }
     }
     if (!fp || !fp->p_rt_params) return;
@@ -1904,6 +1997,7 @@ static void read_settings(void)
     float sc_density = 1.0f, sc_size = 1.0f;
     float sk_wrap = 0, sk_trans = 0, sk_depth = 4.0f, sk_rim = 0, sk_catch = 0, sk_contact = 0, sk_reach = 20.0f;
     float lf_glow = 0, lf_wrap = 0, lf_depth = 40.0f;
+    float sy_style = 0, sy_clouds = 0.5f, sy_sun = 1.0f;
     float rl_depth = 0.0f, rl_shadow = 6.0f;
     int tex_compress = 0, tex_max = 0;
     int on = 1, samples = 8, filter = 2, sky = 0, sandbox = 0;
@@ -1975,6 +2069,9 @@ static void read_settings(void)
         else if (!strcmp(name, "foliage_wrap")) lf_wrap = v;
         else if (!strcmp(name, "foliage_depth")) lf_depth = v;
         else if (!strcmp(name, "contact_reach")) sk_reach = v;
+        else if (!strcmp(name, "sky_style")) sy_style = v;
+        else if (!strcmp(name, "sky_clouds")) sy_clouds = v;
+        else if (!strcmp(name, "sky_sun")) sy_sun = v;
         else if (!strcmp(name, "relief")) rl_depth = v;
         else if (!strcmp(name, "relief_shadow")) rl_shadow = v;
         else if (!strncmp(name, "smoke", 5)) smoke_setting(name, v);
@@ -2023,6 +2120,9 @@ static void read_settings(void)
     char_wrap = sk_wrap; char_trans = sk_trans; char_rim = sk_rim; char_catch = sk_catch;
     rt_set_characters(sk_wrap > 0 || sk_trans > 0, sk_depth, sk_contact, sk_reach);
     leaf_glow = lf_glow; leaf_wrap = lf_wrap;
+    sky_style = sy_style < 0 ? 0 : sy_style > 1 ? 1 : sy_style;
+    sky_clouds = sy_clouds < 0 ? 0 : sy_clouds > 1 ? 1 : sy_clouds;
+    sky_sun = sy_sun < 0 ? 0 : sy_sun > 4 ? 4 : sy_sun;
     rt_set_foliage(lf_glow != 0 || lf_wrap > 0, lf_depth);
     rt_set_enabled(on);
     logmsg("settings: rt=%d samples=%d radius=%.2f filter=%d scale=%.2f max_megapixels=%.1f sky=%d reach=%.0f "
