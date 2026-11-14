@@ -138,6 +138,8 @@ struct prog {
     void *p_rt_shell;                /* terrain programs (vertex and fragment): the shell layer uniform */
     int shell_on;                    /* fragment program: rtShell was left non-zero */
     void *p_rt_relief;               /* lit fragment programs: the parallax relief uniform */
+    void *p_rt_smoke[6];             /* FFFragmentMainTexCol: lit smoke uniforms (see smoke_draw) */
+    int smoke_last;                  /* rtSmoke was left on */
     void *p_rt_wind;                 /* terrain fragment programs: wind and colour patches on the grass */
     void *p_rt_water;                /* the sea's fragment program: stylised water (water_style) and the sun */
     void *p_rt_blade;                /* terrain fragment programs: backlit blades (characters stream) */
@@ -256,6 +258,13 @@ static void setup_program(struct prog *p, const struct cg_record *r)
             p->p_rt_char2 = p_cgGetNamedParameter(h, "rtChar2");
             p->p_rt_relief = p_cgGetNamedParameter(h, "rtRelief");
             p->p_rt_wind = p_cgGetNamedParameter(h, "rtWind");
+            p->p_rt_smoke[0] = p_cgGetNamedParameter(h, "rtSmoke");
+            p->p_rt_smoke[1] = p_cgGetNamedParameter(h, "rtSmokeSun");
+            p->p_rt_smoke[2] = p_cgGetNamedParameter(h, "rtSmokeSunCol");
+            p->p_rt_smoke[3] = p_cgGetNamedParameter(h, "rtSmokeAmb");
+            p->p_rt_smoke[4] = p_cgGetNamedParameter(h, "rtSmokeFx");
+            p->p_rt_smoke[5] = p_cgGetNamedParameter(h, "rtSmokeFxCol");
+            if (!p->p_rt_smoke[1] || !p->p_rt_smoke[2] || !p->p_rt_smoke[3]) p->p_rt_smoke[0] = NULL;
             p->p_rt_water = p_cgGetNamedParameter(h, "rtWater");
             p->p_rt_blade = p_cgGetNamedParameter(h, "rtBlade");
         }
@@ -268,13 +277,15 @@ static void setup_program(struct prog *p, const struct cg_record *r)
 /* Hide this program's extra uniforms from the engine's parameter walks. */
 static void add_rt_params(const struct prog *p)
 {
-    void *h[14];
+    void *h[20];
     int i;
     h[8] = p->p_rt_char; h[9] = p->p_rt_char2;
     h[0] = p->p_rt_normal; h[1] = p->p_rt_params3; h[2] = p->p_rt_refl; h[3] = p->p_rt_bounce;
     h[4] = p->p_rt_params2; h[5] = p->p_rt_params; h[6] = p->p_rt_mask; h[7] = p->p_rt_shell;
     h[10] = p->p_rt_relief; h[11] = p->p_rt_wind; h[12] = p->p_rt_water; h[13] = p->p_rt_blade;
-    for (i = 0; i < 14; i++)
+    h[14] = p->p_rt_smoke[0]; h[15] = p->p_rt_smoke[1]; h[16] = p->p_rt_smoke[2]; h[17] = p->p_rt_smoke[3];
+    h[18] = p->p_rt_smoke[4]; h[19] = p->p_rt_smoke[5];
+    for (i = 0; i < 20; i++)
         if (h[i] && n_rt_param_handles < MAX_RT_PARAMS) rt_param_handles[n_rt_param_handles++] = h[i];
 }
 
@@ -1153,6 +1164,70 @@ static float shell_ground[4];             /* rtShell of the game's own grass dra
 /* Called before every draw. Shadow-pass draws are handed to the tracer as casters.
    Sun-lit main-pass draws get the traced mask: rtParams = (enabled, 1/width, 1/height,
    bounce strength) and the mask texture, for shaders that have those uniforms. */
+/* ---- Lit smoke ----------------------------------------------------------------------
+   The game draws smoke puffs as unlit alpha-blended sprites (FFVertexMainTexCol /
+   FFFragmentMainTexCol), so at night they glow cream. For main-view, alpha-blended draws with
+   a grey/white texture (fx_smoke_texture) the patched fragment program gets rtSmoke on and
+   shades the puff with the sun (direction, colour) and the ambient colour the game's lit
+   shaders get, with a normal from the puff's alpha slope (soft terminator, darker underside).
+   Settings: smoke (0/1), smoke_strength, smoke_step (texture step of the slope),
+   smoke_gain (slope -> normal; negative flips v), smoke_under (what the underside keeps),
+   smoke_sun, smoke_ambient (scales of the two lights). */
+static struct { int on; float strength, step, gain, under, sun, amb, fx; } SM;
+static float smoke_sun_rgb[3] = { 1, 1, 1 }, smoke_amb_rgb[3] = { 0.4f, 0.4f, 0.4f };
+static void smoke_settings_begin(void)
+{
+    SM.on = 0; SM.strength = 1.0f; SM.step = 1.0f / 32.0f; SM.gain = 6.0f; SM.under = 0.55f; SM.sun = 1.0f; SM.amb = 1.0f; SM.fx = 1.0f;
+}
+static void smoke_setting(const char *name, float v)
+{
+    if (!strcmp(name, "smoke")) SM.on = v != 0;
+    else if (!strcmp(name, "smoke_strength")) SM.strength = v;
+    else if (!strcmp(name, "smoke_step")) SM.step = v;
+    else if (!strcmp(name, "smoke_gain")) SM.gain = v;
+    else if (!strcmp(name, "smoke_under")) SM.under = v;
+    else if (!strcmp(name, "smoke_sun")) SM.sun = v;
+    else if (!strcmp(name, "smoke_ambient")) SM.amb = v;
+    else if (!strcmp(name, "smoke_fx")) SM.fx = v;
+}
+static void smoke_draw(struct prog *vp, struct prog *fp)
+{
+    int on = SM.on && vp && vp->unlit_tex && (vp->have & 2) && gs.blend &&
+             gs.blend_src == 0x0302 && gs.blend_dst == 0x0303 && rt_is_main_view(vp->view) && fx_smoke_texture(fp->tex0);
+    if (!on && !fp->smoke_last) return;
+    if (on) {
+        /* the direction towards the sun, in view space (row vectors: v * view) */
+        const float *s = rt_stats.sun, *m = vp->view;
+        float l[3], len;
+        int k;
+        for (k = 0; k < 3; k++) l[k] = s[0] * m[k] + s[1] * m[4 + k] + s[2] * m[8 + k];
+        if ((vp->have & 4) && vp->proj[11] > 0) l[2] = -l[2];   /* left-handed view: the eye looks along +z */
+        len = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+        if (len > 1e-6f) { l[0] /= len; l[1] /= len; l[2] /= len; }
+        real_cgGLSetParameter4f(fp->p_rt_smoke[0], 1.0f, SM.strength, SM.step, SM.gain);
+        real_cgGLSetParameter4f(fp->p_rt_smoke[1], l[0], l[1], l[2], 1.0f);
+        real_cgGLSetParameter4f(fp->p_rt_smoke[2], smoke_sun_rgb[0] * SM.sun, smoke_sun_rgb[1] * SM.sun, smoke_sun_rgb[2] * SM.sun, 0);
+        real_cgGLSetParameter4f(fp->p_rt_smoke[3], smoke_amb_rgb[0] * SM.amb, smoke_amb_rgb[1] * SM.amb, smoke_amb_rgb[2] * SM.amb, SM.under);
+        if (fp->p_rt_smoke[4] && fp->p_rt_smoke[5]) {
+            /* the brightest explosion/fire light (fx.c), in view space */
+            float pr[4], rgb[3], v[3];
+            if (SM.fx > 0 && fx_smoke_light(pr, rgb)) {
+                for (k = 0; k < 3; k++) v[k] = pr[0] * m[k] + pr[1] * m[4 + k] + pr[2] * m[8 + k] + m[12 + k];
+                real_cgGLSetParameter4f(fp->p_rt_smoke[4], v[0], v[1], v[2], pr[3]);
+                real_cgGLSetParameter4f(fp->p_rt_smoke[5], rgb[0] * SM.fx, rgb[1] * SM.fx, rgb[2] * SM.fx,
+                                        (vp->have & 4) && vp->proj[11] > 0 ? -1.0f : 1.0f);
+            } else {
+                real_cgGLSetParameter4f(fp->p_rt_smoke[4], 0, 0, 0, 1);
+                real_cgGLSetParameter4f(fp->p_rt_smoke[5], 0, 0, 0, 1);
+            }
+        }
+    } else {
+        real_cgGLSetParameter4f(fp->p_rt_smoke[0], 0, 0, 0, 0);
+    }
+    fp->smoke_last = on;
+    (*(void (__cdecl **)(void *))IAT_cgUpdateProgramParameters)(fp->h);
+}
+
 static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum itype, const void *indices)
 {
     struct prog *vp = (cur_vp >= 0 && vp_on) ? &progs[cur_vp] : NULL;
@@ -1163,6 +1238,7 @@ static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum ityp
     int caster = vp && vp->caster, lit = vp && vp->sun_lit;
     static int sky_phase;       /* between the shadow pass and the first lit draw: where the sky is drawn */
 
+    if (fp && fp->p_rt_smoke[0]) smoke_draw(vp, fp);
     if (vp) {                   /* film post-processing: where the scene ends (post.c) */
         u32 cls = caster ? POST_CASTER : vp->landscape && lit ? POST_LANDSCAPE : lit ? POST_LIT : 0;
         if (!caster && !lit) cls = vp->water ? POST_WATER : vp->effect ? POST_EFFECT : POST_UNLIT;
@@ -1248,7 +1324,10 @@ static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum ityp
         if (lit && kind <= 2) rt_on_main_alpha(&d);
         if (lit && kind <= 2 && vp->landscape) { scat_draw = d; scat_ok = 1; }
         /* The terrain's shader is only ever given the sun's colours. */
-        if (lit && vp->landscape && fp && (fp->have & 0x180) == 0x180) rt_set_light(fp->dif, fp->amb);
+        if (lit && vp->landscape && fp && (fp->have & 0x180) == 0x180) {
+            rt_set_light(fp->dif, fp->amb);
+            memcpy(smoke_sun_rgb, fp->dif, 12); memcpy(smoke_amb_rgb, fp->amb, 12);
+        }
     }
     if (!fp || !fp->p_rt_params) return;
     if (lit && (vp->have & 6) == 6) tex = rt_prepare_main(vp->view, vp->proj, vp->landscape, inv, msize, &btex);
@@ -1823,6 +1902,7 @@ static void read_settings(void)
     fx_setting(NULL, 0);
     atmos_setting(NULL, 0);
     post_settings_begin();
+    smoke_settings_begin();
     round_settings_begin();
     edges_strength = 0; edges_radius = 8.0f;   /* edges: code defaults (off) */
     while (fgets(line, sizeof line, f)) {
@@ -1885,6 +1965,7 @@ static void read_settings(void)
         else if (!strcmp(name, "contact_reach")) sk_reach = v;
         else if (!strcmp(name, "relief")) rl_depth = v;
         else if (!strcmp(name, "relief_shadow")) rl_shadow = v;
+        else if (!strncmp(name, "smoke", 5)) smoke_setting(name, v);
         else if (!strcmp(name, "tex_compress")) tex_compress = (int)v;
         else if (!strcmp(name, "tex_max")) tex_max = (int)v;
         else if (!strcmp(name, "edges")) edges_strength = v;
