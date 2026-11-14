@@ -1,0 +1,413 @@
+#version 430
+// Film post-processing of the scene before the HUD is drawn (post.c). One file, one pass per
+// program: post.c compiles it once per PASS value (and OUT_RGBA8 when the game's scene texture
+// is 8 bits per channel). Every loop has a constant bound.
+//
+// The game's scene texture holds sRGB-encoded colour; with hdr = 1 it is RGBA16F and lit
+// surfaces may go above 1. Passes work in linear light (gamma 2.2 approximation).
+//
+// PASS 1 FOCUS     one work group: where the camera looks (eye distance at the centre of the
+//                  mask), smoothed over time, and how much of the sun is open sky, into a 1x1 image
+// PASS 2 DOF       scene texture + mask -> tmp: depth of field (gather, golden-angle disc)
+// PASS 3 STORE     tmp -> scene texture
+// PASS 4 PREFILTER scene texture -> bloom level 0 (half size): bright part, 13-tap downsample
+// PASS 5 DOWN      bloom level i -> level i+1 (13-tap)
+// PASS 6 UP        level i += tent(level i+1)
+// PASS 7 COMPOSITE scene texture + bloom -> tone curve, grade, vignette -> ldr (for AA) or the scene texture
+// PASS 8 FXAA      ldr -> scene texture
+
+#ifndef PASS
+#define PASS 7
+#endif
+
+#if PASS == 1
+layout(local_size_x = 64) in;
+#else
+layout(local_size_x = 8, local_size_y = 8) in;
+#endif
+
+uniform vec4 uSize;        // destination width, height, 1/width, 1/height
+uniform vec4 uSrc;         // source width, height, 1/width, 1/height
+uniform vec4 uTone;        // exposure, contrast, knee (start of the shoulder), saturation
+uniform vec4 uGrade;       // warm/cool split strength, vignette, bloom strength, dither (1 = on)
+uniform vec4 uBloom;       // threshold, soft knee, -, -
+uniform vec4 uDof;         // largest blur radius in pixels, strength of the curve, near share, fixed focus (0 = auto)
+uniform vec4 uMask;        // mask width, height, 1/view width * mask width, 1/view height * mask height
+uniform vec4 uFrame;       // focus smoothing per frame, frame number, what PASS 1 does (1 focus, 2 sun, 3 both), -
+uniform vec4 uSun;        // the sun on screen (0..1), 1 if in front of the camera, glare strength
+uniform vec4 uSunCol;     // the sun's colour (linear), glare size
+uniform vec4 uAuto;       // auto exposure strength (0 = off), the scene key it aims at (linear), adaptation per frame, -
+
+const float FAR = 60000.0;
+
+vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+vec3 toDisplay(vec3 c) { return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2)); }
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// exposure, with the automatic part: the scene's mean log luminance (focus texel .z) moved
+// part of the way to the key, never more than -20% / +25%
+float exposureOf(vec4 focusTexel)
+{
+    if (uAuto.x <= 0.0 || focusTexel.w < 0.5) return uTone.x;
+    return uTone.x * clamp(exp2((log2(uAuto.y) - focusTexel.z) * uAuto.x), 0.8, 1.25);
+}
+
+#if PASS == 1
+// ---- focus distance ----------------------------------------------------------------
+layout(binding = 0) uniform sampler2D uMaskTex;
+layout(binding = 1) uniform sampler2D uScene;
+layout(rgba32f, binding = 0) uniform image2D uFocus;
+shared float sD[64];
+shared float sV[64];
+shared float sL[64];
+void main()
+{
+    uint i = gl_LocalInvocationID.x;
+    // sun: 8 x 8 taps over a small disc around it; sky (nothing hit) counts as open
+    {
+        vec2 g = vec2(float(i & 7u), float(i >> 3)) / 7.0 - 0.5;
+        vec2 suv = uSun.xy + g * vec2(0.02 * uSize.y / max(uSize.x, 1.0), 0.02);
+        // a sun off the screen: look at the nearest edge (sky there, or the leaf in front of it)
+        float d = textureLod(uMaskTex, clamp(suv, vec2(0.004), vec2(0.996)), 0.0).y;
+        sV[i] = (uSun.z > 0.5 && (d <= 0.0 || d >= FAR * 0.9)) ? 1.0 : 0.0;
+    }
+    // scene brightness: 16 x 16 samples, mean of log2 luminance (centre weighted twice)
+    {
+        float s = 0.0, wsum = 0.0;
+        for (int k = 0; k < 4; k++) {
+            uint j = i * 4u + uint(k);
+            vec2 q = (vec2(float(j & 15u), float(j >> 4)) + 0.5) / 16.0;
+            float w = 1.0 + step(abs(q.x - 0.5), 0.25) * step(abs(q.y - 0.5), 0.25);
+            s += w * log2(luma(toLinear(textureLod(uScene, q, 0.0).rgb)) + 1e-3);
+            wsum += w;
+        }
+        sL[i] = s / wsum;
+    }
+    // 8 x 8 samples over the middle 12% x 16% of the view
+    vec2 g = vec2(float(i & 7u), float(i >> 3)) / 7.0 - 0.5;
+    vec2 uv = vec2(0.5) + g * vec2(0.12, 0.16);
+    float d = textureLod(uMaskTex, uv, 0.0).y;
+    sD[i] = (d > 0.0 && d < FAR * 0.9) ? d : FAR;
+    barrier();
+    if (i == 0u) {
+        vec4 prevAll = imageLoad(uFocus, ivec2(0));
+        float vis = 0.0;
+        for (int k = 0; k < 64; k++) vis += sV[k];
+        vis /= 64.0;
+        float sunVis = (uint(uFrame.z) & 2u) != 0u ? mix(prevAll.y, vis, 0.3) : prevAll.y;
+        // The camera follows a worm near the middle: focus on the nearest cluster there,
+        // unless a fixed focus distance is set (uDof.w > 0).
+        float mn = FAR;
+        for (int k = 0; k < 64; k++) mn = min(mn, sD[k]);
+        float sum = 0.0, n = 0.0;
+        for (int k = 0; k < 64; k++) if (sD[k] < mn * 1.3 + 1.0) { sum += sD[k]; n += 1.0; }
+        float want = n > 0.0 ? sum / n : FAR;
+        if (uDof.w > 0.0) want = uDof.w;
+        want = min(want, 4000.0);
+        float prev = prevAll.x;
+        float f = (prev <= 0.0) ? want : mix(prev, want, uFrame.x);
+        if ((uint(uFrame.z) & 1u) == 0u) f = prev;
+        float lum = prevAll.z;
+        if ((uint(uFrame.z) & 4u) != 0u) {
+            float m = 0.0;
+            for (int k = 0; k < 64; k++) m += sL[k];
+            m /= 64.0;
+            lum = (prevAll.w < 0.5) ? m : mix(prevAll.z, m, uAuto.z);
+        }
+        imageStore(uFocus, ivec2(0), vec4(f, sunVis, lum, (uint(uFrame.z) & 4u) != 0u ? 1.0 : prevAll.w));
+    }
+}
+#endif
+
+#if PASS == 2
+// ---- depth of field -----------------------------------------------------------------
+layout(binding = 0) uniform sampler2D uScene;
+layout(binding = 1) uniform sampler2D uMaskTex;
+layout(binding = 2) uniform sampler2D uFocusTex;
+layout(rgba16f, binding = 0) uniform writeonly image2D uDst;
+
+float eyeDist(vec2 pix)                 // pix: view pixel centre
+{
+    vec2 m = pix * uMask.zw;            // -> mask pixel
+    float d = texelFetch(uMaskTex, clamp(ivec2(m), ivec2(0), ivec2(uMask.xy) - 1), 0).y;
+    return d > 0.0 ? d : FAR;
+}
+// Signed blur radius in pixels: positive behind the focus, negative in front of it.
+float coc(float d, float focus)
+{
+    float x = 1.0 - focus / max(d, 0.01);           // 0 at the focus, -> 1 far away
+    x *= uDof.y;
+    if (x < 0.0) x *= uDof.z;
+    return uDof.x * clamp(x, -1.0, 1.0);
+}
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(uSize.x) || p.y >= int(uSize.y)) return;
+    vec2 pix = vec2(p) + 0.5;
+    float focus = texelFetch(uFocusTex, ivec2(0), 0).x;
+    vec3 c0 = toLinear(texelFetch(uScene, p, 0).rgb);
+    float d0 = eyeDist(pix);
+    float s0 = abs(coc(d0, focus));
+    vec3 sum = c0;
+    float tot = 1.0;
+    const int N = 40;
+    const float GOLDEN = 2.39996323;
+    float rot = fract(sin(dot(vec2(p), vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+    for (int i = 0; i < N; i++) {
+        float r = uDof.x * sqrt((float(i) + 0.5) / float(N));
+        float a = float(i) * GOLDEN + rot;
+        vec2 q = pix + vec2(cos(a), sin(a)) * r;
+        vec3 sc = toLinear(textureLod(uScene, q * uSize.zw, 0.0).rgb);
+        float sd = eyeDist(q);
+        float ss = abs(coc(sd, focus));
+        if (sd > d0) ss = min(ss, s0 * 2.0);         // what lies behind does not spill over what is in front
+        float m = smoothstep(r - 0.5, r + 0.5, ss);
+        sum += mix(sum / tot, sc, m);
+        tot += 1.0;
+    }
+    imageStore(uDst, p, vec4(toDisplay(sum / tot), 1.0));
+}
+#endif
+
+#if PASS == 3 || PASS == 8
+#ifdef OUT_RGBA8
+layout(rgba8, binding = 0) uniform writeonly image2D uOut;
+#else
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+#endif
+#endif
+
+#if PASS == 3
+layout(binding = 0) uniform sampler2D uSrcTex;
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(uSize.x) || p.y >= int(uSize.y)) return;
+    imageStore(uOut, p, vec4(texelFetch(uSrcTex, p, 0).rgb, 1.0));
+}
+#endif
+
+#if PASS == 4 || PASS == 5
+// ---- bloom downsample (13 taps, "Next generation post processing in Call of Duty") ----
+layout(binding = 0) uniform sampler2D uSrcTex;
+#if PASS == 4
+layout(binding = 1) uniform sampler2D uFocusTex;
+float gExposure = 1.0;
+#endif
+layout(rgba16f, binding = 0) uniform writeonly image2D uDst;
+vec3 tap(vec2 uv)
+{
+    vec3 c = textureLod(uSrcTex, uv, 0.0).rgb;
+#if PASS == 4
+    c = toLinear(c) * gExposure;
+#endif
+    return c;
+}
+#if PASS == 4
+vec3 bright(vec3 c)                     // soft-knee threshold
+{
+    float br = max(c.r, max(c.g, c.b));
+    float t = uBloom.x, k = max(uBloom.y, 1e-4);
+    float soft = clamp(br - t + k, 0.0, 2.0 * k);
+    soft = soft * soft / (4.0 * k);
+    float w = max(soft, br - t) / max(br, 1e-4);
+    return c * w;
+}
+#endif
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(uSize.x) || p.y >= int(uSize.y)) return;
+    vec2 uv = (vec2(p) + 0.5) * uSize.zw;
+    vec2 t = uSrc.zw;
+#if PASS == 4
+    gExposure = exposureOf(texelFetch(uFocusTex, ivec2(0), 0));
+#endif
+    vec3 a = tap(uv + t * vec2(-2, -2)), b = tap(uv + t * vec2(0, -2)), c = tap(uv + t * vec2(2, -2));
+    vec3 d = tap(uv + t * vec2(-1, -1)), e = tap(uv + t * vec2(1, -1));
+    vec3 f = tap(uv + t * vec2(-2, 0)), g = tap(uv), h = tap(uv + t * vec2(2, 0));
+    vec3 i = tap(uv + t * vec2(-1, 1)), j = tap(uv + t * vec2(1, 1));
+    vec3 k = tap(uv + t * vec2(-2, 2)), l = tap(uv + t * vec2(0, 2)), m = tap(uv + t * vec2(2, 2));
+    vec3 o = (d + e + i + j) * 0.125 + (a + b + f + g) * 0.03125 + (b + c + g + h) * 0.03125 +
+             (f + g + k + l) * 0.03125 + (g + h + l + m) * 0.03125;
+#if PASS == 4
+    o = bright(o);
+    o = min(o, vec3(64.0));
+#endif
+    imageStore(uDst, p, vec4(o, 1.0));
+}
+#endif
+
+#if PASS == 6
+// ---- bloom upsample: this level += tent filter of the smaller one --------------------
+layout(binding = 0) uniform sampler2D uSrcTex;          // the smaller level
+layout(rgba16f, binding = 0) uniform image2D uDst;      // this level, added to in place
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(uSize.x) || p.y >= int(uSize.y)) return;
+    vec2 uv = (vec2(p) + 0.5) * uSize.zw;
+    vec2 t = uSrc.zw;
+    vec3 s = textureLod(uSrcTex, uv + t * vec2(-1, -1), 0.0).rgb + textureLod(uSrcTex, uv + t * vec2(1, -1), 0.0).rgb +
+             textureLod(uSrcTex, uv + t * vec2(-1, 1), 0.0).rgb + textureLod(uSrcTex, uv + t * vec2(1, 1), 0.0).rgb +
+             2.0 * (textureLod(uSrcTex, uv + t * vec2(0, -1), 0.0).rgb + textureLod(uSrcTex, uv + t * vec2(0, 1), 0.0).rgb +
+                    textureLod(uSrcTex, uv + t * vec2(-1, 0), 0.0).rgb + textureLod(uSrcTex, uv + t * vec2(1, 0), 0.0).rgb) +
+             4.0 * textureLod(uSrcTex, uv, 0.0).rgb;
+    vec3 own = imageLoad(uDst, p).rgb;
+    imageStore(uDst, p, vec4(own + s / 16.0, 1.0));
+}
+#endif
+
+#if PASS == 7
+// ---- tone curve and grade ----------------------------------------------------------------
+layout(binding = 0) uniform sampler2D uScene;
+layout(binding = 1) uniform sampler2D uBloomTex;        // bloom level 0 after the upsampling
+layout(binding = 2) uniform sampler2D uFocusTex;        // .y: how much of the sun is open sky
+#ifdef TO_LDR
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+#elif defined(OUT_RGBA8)
+layout(rgba8, binding = 0) uniform writeonly image2D uOut;
+#else
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+#endif
+
+// Linear up to the knee, then a soft shoulder that reaches 1 only at infinity.
+float shoulder(float x, float k)
+{
+    if (x <= k) return x;
+    float r = 1.0 - k;
+    return k + r * (1.0 - exp(-(x - k) / r));
+}
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(uSize.x) || p.y >= int(uSize.y)) return;
+    vec2 uv = (vec2(p) + 0.5) * uSize.zw;
+    vec3 c = toLinear(texelFetch(uScene, p, 0).rgb) * exposureOf(texelFetch(uFocusTex, ivec2(0), 0));
+    if (uGrade.z > 0.0) c += textureLod(uBloomTex, uv, 0.0).rgb * uGrade.z;
+    // sun glare: a bright core and a wide soft halo around the sun, as much as it is in open sky
+    if (uSun.w > 0.0) {
+        float vis = texelFetch(uFocusTex, ivec2(0), 0).y;
+        if (vis > 0.001) {
+            vec2 q = (uv - uSun.xy) * vec2(uSize.x * uSize.w, 1.0) / max(uSunCol.w, 1e-3);
+            float r2 = dot(q, q);
+            float g = 2.0 * exp(-r2 * 400.0) + 0.35 * exp(-r2 * 30.0) + 0.08 / (1.0 + r2 * 40.0);
+            c += uSunCol.rgb * (g * uSun.w * vis);
+        }
+    }
+    // contrast around middle grey, in log space
+    c = 0.18 * pow(max(c, vec3(1e-6)) / 0.18, vec3(uTone.y));
+    // saturation
+    float y = luma(c);
+    vec3 ch = c - y;
+    float sat = max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b);
+    float vib = sat / max(max(max(c.r, c.g), c.b), 1e-4);
+    c = y + ch * mix(uTone.w, 1.0, vib * vib);     // vibrance: colours already strong are left alone
+    c = max(c, vec3(0.0));
+    // warm light, cool shade
+    if (uGrade.x > 0.0) {
+        float t = smoothstep(0.02, 0.6, y);
+        vec3 tint = mix(vec3(0.93, 0.98, 1.08), vec3(1.07, 1.0, 0.9), t);
+        c *= mix(vec3(1.0), tint, uGrade.x);
+    } else if (uGrade.x < 0.0) {        // night: moonlight blue, a little more in the shade
+        float t = smoothstep(0.02, 0.6, y);
+        vec3 tint = mix(vec3(0.88, 0.95, 1.12), vec3(0.96, 0.99, 1.04), t);
+        c *= mix(vec3(1.0), tint, -uGrade.x);
+    }
+    // vignette
+    if (uGrade.y > 0.0) {
+        vec2 q = uv - 0.5;
+        q.x *= uSize.x * uSize.w;
+        float v = 1.0 - dot(q, q) * 1.2;
+        c *= mix(1.0, clamp(v, 0.0, 1.0), uGrade.y);
+    }
+    c = vec3(shoulder(c.r, uTone.z), shoulder(c.g, uTone.z), shoulder(c.b, uTone.z));
+    vec3 o = toDisplay(c);
+    if (uGrade.w > 0.0) {               // triangular dither of +-1 step of 8 bits
+        float n1 = fract(sin(dot(vec2(p) + uFrame.y * 0.37, vec2(12.9898, 78.233))) * 43758.5453);
+        float n2 = fract(sin(dot(vec2(p) + uFrame.y * 0.71, vec2(39.3468, 11.135))) * 24634.6345);
+        o += (n1 + n2 - 1.0) / 255.0;
+    }
+    imageStore(uOut, p, vec4(o, luma(o)));
+}
+#endif
+
+#if PASS == 8
+// ---- FXAA (after Timothy Lottes' FXAA 3.11, quality preset 12 style) -----------------------
+layout(binding = 0) uniform sampler2D uSrcTex;          // display colour, luma in alpha
+float L(vec2 uv) { return textureLod(uSrcTex, uv, 0.0).a; }
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(uSize.x) || p.y >= int(uSize.y)) return;
+    vec2 rcp = uSize.zw;
+    vec2 uv = (vec2(p) + 0.5) * rcp;
+    vec4 rgbyM = texelFetch(uSrcTex, p, 0);
+    float lumaM = rgbyM.a;
+    float lumaS = L(uv + vec2(0, 1) * rcp), lumaE = L(uv + vec2(1, 0) * rcp);
+    float lumaN = L(uv + vec2(0, -1) * rcp), lumaW = L(uv + vec2(-1, 0) * rcp);
+    float rangeMax = max(max(max(lumaS, lumaE), max(lumaN, lumaW)), lumaM);
+    float rangeMin = min(min(min(lumaS, lumaE), min(lumaN, lumaW)), lumaM);
+    float range = rangeMax - rangeMin;
+    if (range < max(0.0312, rangeMax * 0.125)) { imageStore(uOut, p, vec4(rgbyM.rgb, 1.0)); return; }
+    float lumaNW = L(uv + vec2(-1, -1) * rcp), lumaSE = L(uv + vec2(1, 1) * rcp);
+    float lumaNE = L(uv + vec2(1, -1) * rcp), lumaSW = L(uv + vec2(-1, 1) * rcp);
+    float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;
+    float subpixNSWE = lumaNS + lumaWE;
+    float edgeHorz1 = -2.0 * lumaM + lumaNS, edgeVert1 = -2.0 * lumaM + lumaWE;
+    float lumaNESE = lumaNE + lumaSE, lumaNWNE = lumaNW + lumaNE;
+    float edgeHorz2 = -2.0 * lumaE + lumaNESE, edgeVert2 = -2.0 * lumaN + lumaNWNE;
+    float lumaNWSW = lumaNW + lumaSW, lumaSWSE = lumaSW + lumaSE;
+    float edgeHorz4 = abs(edgeHorz1) * 2.0 + abs(edgeHorz2);
+    float edgeVert4 = abs(edgeVert1) * 2.0 + abs(edgeVert2);
+    float edgeHorz3 = -2.0 * lumaW + lumaNWSW, edgeVert3 = -2.0 * lumaS + lumaSWSE;
+    float edgeHorz = abs(edgeHorz3) + edgeHorz4, edgeVert = abs(edgeVert3) + edgeVert4;
+    float subpixNWSWNESE = lumaNWSW + lumaNESE;
+    float lengthSign = rcp.x;
+    bool horzSpan = edgeHorz >= edgeVert;
+    float subpixA = subpixNSWE * 2.0 + subpixNWSWNESE;
+    if (!horzSpan) { lumaN = lumaW; lumaS = lumaE; } else lengthSign = rcp.y;
+    float subpixB = (subpixA * (1.0 / 12.0)) - lumaM;
+    float gradientN = lumaN - lumaM, gradientS = lumaS - lumaM;
+    float lumaNN = lumaN + lumaM, lumaSS = lumaS + lumaM;
+    bool pairN = abs(gradientN) >= abs(gradientS);
+    float gradient = max(abs(gradientN), abs(gradientS));
+    if (pairN) lengthSign = -lengthSign;
+    float subpixC = clamp(abs(subpixB) / range, 0.0, 1.0);
+    vec2 posB = uv;
+    vec2 offNP = horzSpan ? vec2(rcp.x, 0.0) : vec2(0.0, rcp.y);
+    if (!horzSpan) posB.x += lengthSign * 0.5; else posB.y += lengthSign * 0.5;
+    vec2 posN = posB - offNP, posP = posB + offNP;
+    float subpixD = -2.0 * subpixC + 3.0;
+    float lumaEndN = L(posN), lumaEndP = L(posP);
+    float subpixE = subpixC * subpixC;
+    if (!pairN) lumaNN = lumaSS;
+    float gradientScaled = gradient * 0.25;
+    float lumaMM = lumaM - lumaNN * 0.5;
+    float subpixF = subpixD * subpixE;
+    bool lumaMLTZero = lumaMM < 0.0;
+    lumaEndN -= lumaNN * 0.5; lumaEndP -= lumaNN * 0.5;
+    bool doneN = abs(lumaEndN) >= gradientScaled, doneP = abs(lumaEndP) >= gradientScaled;
+    const float STEP[8] = float[8](1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+    for (int i = 0; i < 8; i++) {
+        if (doneN && doneP) break;
+        if (!doneN) { posN -= offNP * STEP[i]; lumaEndN = L(posN) - lumaNN * 0.5; doneN = abs(lumaEndN) >= gradientScaled; }
+        if (!doneP) { posP += offNP * STEP[i]; lumaEndP = L(posP) - lumaNN * 0.5; doneP = abs(lumaEndP) >= gradientScaled; }
+    }
+    float dstN = horzSpan ? uv.x - posN.x : uv.y - posN.y;
+    float dstP = horzSpan ? posP.x - uv.x : posP.y - uv.y;
+    bool goodSpanN = (lumaEndN < 0.0) != lumaMLTZero;
+    bool goodSpanP = (lumaEndP < 0.0) != lumaMLTZero;
+    float spanLength = dstP + dstN;
+    bool directionN = dstN < dstP;
+    float dst = min(dstN, dstP);
+    bool goodSpan = directionN ? goodSpanN : goodSpanP;
+    float pixelOffset = (dst * (-1.0 / spanLength)) + 0.5;
+    float subpixH = subpixF * subpixF * 0.75;
+    float pixelOffsetGood = goodSpan ? pixelOffset : 0.0;
+    float pixelOffsetSubpix = max(pixelOffsetGood, subpixH);
+    vec2 q = uv;
+    if (!horzSpan) q.x += pixelOffsetSubpix * lengthSign; else q.y += pixelOffsetSubpix * lengthSign;
+    imageStore(uOut, p, vec4(textureLod(uSrcTex, q, 0.0).rgb, 1.0));
+}
+#endif

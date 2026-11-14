@@ -1,0 +1,158 @@
+#version 430
+// Light from effects (explosions, fire, glowing debris), after the tracer's own passes.
+// The effect lights are points with a size (fx.c finds them in the game's additive draws);
+// wumrt_trace.comp compiled with FX_PASS traced one shadow ray per pixel towards each of the
+// four brightest. This pass runs twice:
+//   uMode 0: accumulates those visibilities over time like the sun's (reprojected, history
+//            clamped to what the neighbourhood shows now, so a moving shadow leaves no trail);
+//   uMode 1: blurs them a little along surfaces, works out the light every effect sends to
+//            the pixel's surface (inverse square, faded out at the light's reach, sphere-light
+//            horizon) and adds it to the indirect light that the game's shaders use in place
+//            of the ambient colour. That texture is also last frame's light for the sky rays'
+//            hits, so the effects' light bounces too.
+// The lights' brightness itself is never accumulated: a flash is on screen in the frame it
+// happens and gone when it is.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+struct FxLight { vec4 pr; vec4 col; };  // pr: world position, radius of the glowing ball; col: rgb intensity, w: reach
+layout(std430, binding = 8) readonly buffer FxBuf { FxLight fxl[]; };
+
+layout(rgba16f, binding = 1) uniform readonly image2D uGeom;    // this frame's trace: sun, distance, normal
+layout(rgba16f, binding = 2) uniform readonly image2D uFxIn;    // mode 0: this frame's visibilities; 1: accumulated
+layout(rgba16f, binding = 4) uniform readonly image2D uPrevFx;  // mode 0: last frame's accumulated visibilities
+layout(rgba16f, binding = 5) uniform readonly image2D uPrevMask;// mode 0: last frame's mask (y distance, w frames)
+layout(rgba16f, binding = 0) uniform writeonly image2D uFxOut;  // mode 0: accumulated visibilities
+layout(rgba16f, binding = 6) uniform image2D uLight;            // mode 1: the indirect light, read and written
+
+uniform int uMode;
+uniform vec3 uEye, uBase, uDx, uDy;     // ray through pixel (x, y): uBase + x*uDx + y*uDy - uEye
+uniform vec4 uFx;                       // x = lights, y = how many have shadow rays, z = strength
+uniform vec4 uReset;                    // per shadowed light: 1 = its history belongs to another light
+uniform vec4 uHist;                     // x = smallest share of the new frame, y = 1 if last frame's images can be used
+uniform mat4 uPrevVP;
+uniform vec3 uPrevEye;
+
+const float FAR = 60000.0;
+const int MAX_FX = 16;
+const vec3 LUM = vec3(0.3, 0.59, 0.11);
+
+vec3 octDecode(vec2 e)
+{
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+vec3 pointAt(ivec2 p, float t)
+{
+    return uEye + normalize(uBase + uDx * float(p.x) + uDy * float(p.y) - uEye) * t;
+}
+
+// Light that effect i sends to a surface at p with normal n (no shadow).
+vec3 fxIrradiance(int i, vec3 p, vec3 n)
+{
+    FxLight L = fxl[i];
+    vec3 v = L.pr.xyz - p;
+    float d2 = dot(v, v);
+    float reach = L.col.w;
+    if (reach <= 0.0 || d2 >= reach * reach) return vec3(0.0);
+    float dist = sqrt(d2), r = L.pr.w;
+    // A ball, not a point: it still lights a surface that is tilted a little past its horizon.
+    float s = min(r / max(dist, 1e-3), 1.0);
+    float nl = clamp((dot(n, v / max(dist, 1e-3)) + s) / (1.0 + s), 0.0, 1.0);
+    float x = d2 / (reach * reach);
+    float fade = (1.0 - x) * (1.0 - x);
+    return L.col.rgb * (nl * fade / (d2 + r * r));
+}
+
+void temporal(ivec2 pix, ivec2 size)
+{
+    vec4 c = imageLoad(uGeom, pix);
+    vec4 cur = imageLoad(uFxIn, pix);
+    vec4 result = cur;
+    if (c.y < FAR - 1.0 && uHist.y > 0.5) {
+        vec3 p = pointAt(pix, c.y);
+        vec4 clip = uPrevVP * vec4(p, 1.0);
+        if (clip.w > 1e-4) {
+            vec2 pp = (clip.xy / clip.w * 0.5 + 0.5) * vec2(size) - 0.5;
+            ivec2 base = ivec2(floor(pp));
+            vec2 f = pp - vec2(base);
+            float expect = length(p - uPrevEye);
+            float tol = 0.02 * expect + 0.3;
+            vec4 sum = vec4(0.0);
+            float wsum = 0.0;
+            for (int j = 0; j < 2; j++)
+                for (int i = 0; i < 2; i++) {
+                    ivec2 q = base + ivec2(i, j);
+                    if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+                    vec4 pm = imageLoad(uPrevMask, q);
+                    if (pm.w < 0.5 || abs(pm.y - expect) > tol) continue;
+                    float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+                    sum += imageLoad(uPrevFx, q) * w;
+                    wsum += w;
+                }
+            if (wsum > 0.05) {
+                vec4 lo = cur, hi = cur;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        vec4 v = imageLoad(uFxIn, clamp(pix + ivec2(dx, dy), ivec2(0), size - 1));
+                        lo = min(lo, v); hi = max(hi, v);
+                    }
+                vec4 old = clamp(sum / wsum, lo, hi);
+                old = mix(old, cur, uReset);            // a light new to its slot starts over
+                result = mix(old, cur, uHist.x);
+            }
+        }
+    }
+    imageStore(uFxOut, pix, result);
+}
+
+void compose(ivec2 pix, ivec2 size)
+{
+    vec4 g = imageLoad(uGeom, pix);
+    if (g.y >= FAR - 1.0) return;
+    vec3 nc = octDecode(g.zw);
+    vec3 pc = pointAt(pix, g.y);
+    float tol = 0.004 * g.y + 0.03;
+    // The visibilities, blurred along the surface (5 x 5, same plane and facing only).
+    vec4 sum = imageLoad(uFxIn, pix);
+    float wsum = 1.0;
+    int nShadow = min(int(uFx.y), 4);
+    if (nShadow > 0) {
+        for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                ivec2 q = pix + ivec2(dx, dy);
+                if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+                vec4 s = imageLoad(uGeom, q);
+                if (s.y >= FAR - 1.0) continue;
+                if (dot(octDecode(s.zw), nc) < 0.9) continue;
+                if (abs(dot(pointAt(q, s.y) - pc, nc)) > tol) continue;
+                float w = exp(-float(dx * dx + dy * dy) / 3.0);
+                sum += imageLoad(uFxIn, q) * w;
+                wsum += w;
+            }
+    }
+    vec4 vis = sum / wsum;
+    vec3 e = vec3(0.0);
+    int n = min(int(uFx.x), MAX_FX);
+    for (int i = 0; i < MAX_FX; i++) {
+        if (i >= n) break;
+        vec3 l = fxIrradiance(i, pc, nc);
+        if (i < nShadow) l *= vis[i];
+        e += l;
+    }
+    e *= uFx.z;
+    if (dot(e, LUM) < 1e-4) return;
+    vec4 cur = imageLoad(uLight, pix);
+    imageStore(uLight, pix, vec4(cur.rgb + e, cur.a));
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uGeom);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+    if (uMode == 0) temporal(pix, size);
+    else compose(pix, size);
+}

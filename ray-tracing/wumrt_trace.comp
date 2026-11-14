@@ -1,0 +1,730 @@
+#version 430
+// Sun shadow and sky light tracer. One camera ray per pixel finds the visible surface among
+// the shadow casters, then one or more rays towards the sun decide how much of it is lit,
+// and rays over the hemisphere above it gather the light that arrives from everywhere else.
+// Output per pixel: x = sun visibility (0..1), y = distance from the eye to the surface,
+// zw = the surface normal (octahedral), used by the filter pass. Second image: x = share of
+// the sky that is visible, yzw = indirect light (rgb).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// A node holds its two children's boxes. Child i: n_i > 0 = leaf with primitives c_i .. c_i+n_i-1,
+// else c_i is another node (see rt.h).
+struct Node { vec3 lo0; uint c0; vec3 hi0; uint n0; vec3 lo1; uint c1; vec3 hi1; uint n1; };
+struct Tri { vec3 v0; uint uv0; vec3 e1; uint uv1; vec3 e2; uint uv2; };  // uv: packed, see rt.h
+// r: rows of world -> object. albedo.w: the texture layer of the mesh, or -1 if every
+// triangle carries its own (the merged BVH).
+struct Inst { vec4 r0, r1, r2; uint nodeBase, triBase, alphaOff; float alphaRef; vec4 albedo; };
+
+layout(std430, binding = 0) readonly buffer NodeBuf { Node nodes[]; };
+layout(std430, binding = 1) readonly buffer TriBuf { Tri tris[]; };
+layout(std430, binding = 2) readonly buffer TlasBuf { Node tlas[]; };
+layout(std430, binding = 3) readonly buffer InstBuf { Inst insts[]; };
+// Alpha masks of textures used by alpha-tested casters: width, height, then one byte per texel.
+layout(std430, binding = 4) readonly buffer AlphaBuf { uint alphaWords[]; };
+// Set to 1 if a ray ever needed a deeper stack than it had (it then skipped part of the
+// scene). The harness reads this and switches to bigger stacks, which are much slower.
+layout(std430, binding = 5) buffer StatBuf { uint overflowed; };
+// Material of each texture layer, two entries per layer: (roughness, reflectivity, metal, -)
+// and (emissive rgb, -). Roughness 1 = matte; reflectivity scales how much a non-metal
+// mirrors; a metal mirrors in its own colour.
+layout(std430, binding = 6) readonly buffer MatBuf { vec4 mats[]; };
+// Smooth normals of each triangle's corners, index for index with tris[]: xyz = octahedral
+// (16 + 16 bits each), w = 1 if the mesh has them (else use the flat normal).
+layout(std430, binding = 7) readonly buffer NrmBuf { uvec4 nrms[]; };
+
+#define MAX_STEPS 2048        // node visits one ray may make in one BVH before it gives up
+#ifndef MESH_STACK
+#define MESH_STACK 24
+#endif
+#ifndef TOP_STACK
+#define TOP_STACK 16
+#endif
+layout(rgba16f, binding = 0) uniform writeonly image2D uMask;
+layout(rgba16f, binding = 2) uniform writeonly image2D uSky;     // x = sky visibility, yzw = indirect light
+layout(rgba16f, binding = 4) uniform readonly image2D uPrevMask; // last frame's result: sun, distance, sky
+layout(rgba16f, binding = 5) uniform readonly image2D uPrevLight;    // and its indirect light
+layout(rgba16f, binding = 6) uniform writeonly image2D uRefl;    // rgb = what the sea mirrors at this pixel, a = 1 where the sea is visible
+
+uniform sampler2DArray uAlbedo;         // one layer per material texture (see rt_core.c)
+uniform sampler2D uSkyAtlas;            // the sky in six square views, 3 x 2
+
+uniform vec3 uEye, uBase, uDx, uDy;     // ray through pixel (x, y): uBase + x*uDx + y*uDy - uEye
+uniform vec3 uSun;                      // unit vector towards the sun
+uniform vec4 uParams;                   // x = sun samples, y = tan(sun radius), z = noise seed
+uniform int uCounts;                    // number of top-level nodes
+// x = sky rays per pixel (0 = off), y = how far they reach, z = 1: also gather bounced
+// sunlight, 2: gather all indirect light (sky colour, lit surfaces), w = noise seed (changes
+// per frame when results are accumulated)
+uniform vec4 uSkyParams;
+uniform vec3 uSunCol;                   // colour of the sunlight
+uniform vec4 uSkyGain;                  // x = brightness of the sky, y = 1 if uSkyAtlas is filled, zw = ambient colour (r, g)
+uniform vec4 uFallback;                 // rgb = indirect light assumed where none is known yet, w = ambient colour (b)
+uniform vec4 uGi;                       // x = 1 if last frame's result can be used, y = height of the sea, z = 1 if there is one, w = strength of light from surfaces
+uniform vec4 uSkyTint;                  // x = how much of the sky's own colour its light keeps (0 = the ambient colour's hue, 1 = all)
+uniform vec4 uLeaf;                     // foliage (mats[].w = 4): x = 1: trace light through leaves, y = depth
+uniform vec4 uChar;                     // characters: x = 1: trace through skin (mats[].w > 0 = on a character), y = body depth
+                                        // that lets 1/e of the sunlight through, z = extra darkening of sky light blocked by a
+                                        // character, w = its reach (world units)
+uniform mat4 uCaps[8];                 // characters as capsules, two per matrix: columns = end A (xyz, radius), end B
+uniform int uNCaps;                     // how many (0 = no contact shadow)
+uniform vec4 uReflect;                  // x = 1: trace what the sea mirrors, y = 1: and what glossy surfaces mirror, z = strength of that, w = 1: smooth normals (see main)
+uniform mat4 uPrevVP;                   // last frame's view * projection
+uniform vec3 uPrevEye;
+uniform vec4 uCloud;                    // moss: cloud shadows: x = strength (0 = off), y = size of a cloud (world units), zw = drift (world units)
+uniform vec4 uGiRate;                   // x = 1, 2 or 4: share of the pixel blocks that trace sky rays each frame is 1/x
+
+// ---- moss: cloud shadows ----------------------------------------------------------------
+// Soft drifting cloud shadows: the point is carried along the sun direction down to the
+// height 0 plane, and a smooth value noise there (two octaves, thresholded softly) says how
+// much of the sun a cloud takes away. No loops; 1 when uCloud.x is 0.
+float cloudHash(vec2 c)
+{
+    return fract(sin(dot(c, vec2(127.1, 311.7))) * 43758.5453);
+}
+float cloudNoise(vec2 x)
+{
+    vec2 i = floor(x), f = x - i;
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(cloudHash(i), cloudHash(i + vec2(1.0, 0.0)), f.x),
+               mix(cloudHash(i + vec2(0.0, 1.0)), cloudHash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float cloudLight(vec3 p)
+{
+    if (uCloud.x <= 0.0) return 1.0;
+    vec2 q = p.xz - uSun.xz * (p.y / max(uSun.y, 0.25)) + uCloud.zw;
+    vec2 u = q / max(uCloud.y, 1.0);
+    float c = cloudNoise(u) * 0.65 + cloudNoise(u * 2.3 + vec2(5.3, 1.7)) * 0.35;
+    return 1.0 - uCloud.x * smoothstep(0.42, 0.68, c);
+}
+// ---- end moss: cloud shadows ------------------------------------------------------------
+                                        // (1 only when there is no history), y = frame number, z = distance beyond
+                                        // which a pixel traces half the sky rays (0 = never)
+
+const float T_MIN = 1e-3;
+float gTmin = T_MIN;                    // nearest hit that counts; raised for some shadow rays (see main)
+uint gTri = 0u;                         // the last closest hit: its triangle (index into tris[] and nrms[])
+int gInst = -1;                         // and its instance
+// The nearest triangle the last closest-hit ray found: its packed texture coordinates,
+// where in it the ray hit, and the texture layer of its mesh (-1: per triangle).
+uint gUv0 = 0u, gUv1 = 0u, gUv2 = 0u;
+vec2 gBary = vec2(0.0);
+float gLayer = 0.0;
+const float SKY_FACE = 256.0;
+const float FAR = 60000.0;
+
+vec3 safeInv(vec3 d)
+{
+    vec3 a = abs(d);
+    return vec3(a.x > 1e-20 ? 1.0 / d.x : 1e20, a.y > 1e-20 ? 1.0 / d.y : 1e20, a.z > 1e-20 ? 1.0 / d.z : 1e20);
+}
+
+// Distance at which the ray enters the box, or -1 if it misses it (or enters beyond tmax).
+float boxEntry(vec3 lo, vec3 hi, vec3 o, vec3 inv, float tmax)
+{
+    vec3 t0 = (lo - o) * inv, t1 = (hi - o) * inv;
+    vec3 a = min(t0, t1), b = max(t0, t1);
+    float tn = max(max(a.x, a.y), max(a.z, 0.0));
+    float tf = min(min(b.x, b.y), min(b.z, tmax));
+    return tn <= tf ? tn : -1.0;
+}
+
+vec2 unpackUv(uint p)
+{
+    return vec2(float(p >> 18), float((p >> 4) & 0x3FFFu)) * (1.0 / 1024.0);
+}
+
+float alphaAt(uint off, vec2 uv)
+{
+    uint w = alphaWords[off], h = alphaWords[off + 1u];
+    uvec2 q = min(uvec2(fract(uv) * vec2(float(w), float(h))), uvec2(w - 1u, h - 1u));
+    uint i = q.y * w + q.x;
+    return float((alphaWords[off + 2u + (i >> 2)] >> ((i & 3u) * 8u)) & 0xFFu) * (1.0 / 255.0);
+}
+
+// Triangles first .. first+count-1 of a mesh. Returns true if one was hit closer than `best`.
+bool hitTris(uint first, uint count, uint alphaOff, float alphaRef, vec3 o, vec3 d, inout float best, inout vec3 n)
+{
+    bool found = false;
+    count = min(count, 64u);            // a leaf never holds more; bounded like the node loops
+    for (uint k = 0u; k < count; k++) {
+        Tri t = tris[first + k];
+        vec3 e1 = t.e1, e2 = t.e2;
+        vec3 p = cross(d, e2);
+        float det = dot(e1, p);
+        if (abs(det) < 1e-20) continue;
+        float idet = 1.0 / det;
+        vec3 s = o - t.v0;
+        float u = dot(s, p) * idet;
+        if (u < 0.0 || u > 1.0) continue;
+        vec3 q = cross(s, e1);
+        float v = dot(d, q) * idet;
+        if (v < 0.0 || u + v > 1.0) continue;
+        float tt = dot(e2, q) * idet;
+        if (tt > gTmin && tt < best) {
+            if (alphaOff != 0u) {
+                vec2 uv = unpackUv(t.uv0) * (1.0 - u - v) + unpackUv(t.uv1) * u + unpackUv(t.uv2) * v;
+                if (alphaAt(alphaOff, uv) <= alphaRef) continue;
+            }
+            best = tt;
+            found = true;
+            n = cross(e1, e2);
+            gUv0 = t.uv0; gUv1 = t.uv1; gUv2 = t.uv2;
+            gBary = vec2(u, v);
+            gTri = first + k;
+        }
+    }
+    return found;
+}
+
+// One mesh, ray in the mesh's own space. Returns true on a hit closer than `best`.
+// alphaOff != 0: the mesh is alpha tested; hits on transparent texels do not count.
+bool traceMesh(uint nodeBase, uint triBase, uint alphaOff, float alphaRef, vec3 o, vec3 d, inout float best,
+               bool anyHit, out vec3 n)
+{
+    uint stack[MESH_STACK];
+    int sp = 0;
+    bool found = false;
+    vec3 inv = safeInv(d);
+    uint ni = 0u;
+    n = vec3(0.0);
+    // Bounded on purpose: bad data must never be able to hang the GPU.
+    for (int guard = 0; guard < MAX_STEPS; guard++) {
+        Node nd = nodes[nodeBase + ni];
+        float t0 = boxEntry(nd.lo0, nd.hi0, o, inv, best);
+        float t1 = boxEntry(nd.lo1, nd.hi1, o, inv, best);
+        if (t0 >= 0.0 && nd.n0 > 0u) {
+            if (hitTris(triBase + nd.c0, nd.n0, alphaOff, alphaRef, o, d, best, n)) { found = true; if (anyHit) return true; }
+            t0 = -1.0;
+        }
+        if (t1 >= 0.0 && nd.n1 > 0u) {
+            if (t1 < best && hitTris(triBase + nd.c1, nd.n1, alphaOff, alphaRef, o, d, best, n)) { found = true; if (anyHit) return true; }
+            t1 = -1.0;
+        }
+        if (t0 >= best) t0 = -1.0;
+        if (t1 >= best) t1 = -1.0;
+        if (t0 >= 0.0 && t1 >= 0.0) {       // two inner children: nearer first, the other waits
+            if (t0 <= t1) { if (sp < MESH_STACK) { stack[sp++] = nd.c1; } else overflowed = 1u; ni = nd.c0; }
+            else { if (sp < MESH_STACK) { stack[sp++] = nd.c0; } else overflowed = 1u; ni = nd.c1; }
+            continue;
+        }
+        if (t0 >= 0.0) { ni = nd.c0; continue; }
+        if (t1 >= 0.0) { ni = nd.c1; continue; }
+        bool got = false;                   // next from the stack, skipping what is now too far
+        while (sp > 0) {
+            sp--;
+            ni = stack[sp]; got = true; break;
+        }
+        if (!got) break;
+    }
+    return found;
+}
+
+// One instance: the ray goes into the mesh's own space.
+bool traceInstance(uint index, vec3 o, vec3 d, inout float best, bool anyHit, inout vec3 nWorld)
+{
+    Inst I = insts[index];
+    vec4 o4 = vec4(o, 1.0);
+    vec3 oo = vec3(dot(I.r0, o4), dot(I.r1, o4), dot(I.r2, o4));
+    vec3 od = vec3(dot(I.r0.xyz, d), dot(I.r1.xyz, d), dot(I.r2.xyz, d));
+    vec3 n;
+    if (!traceMesh(I.nodeBase, I.triBase, I.alphaOff, I.alphaRef, oo, od, best, anyHit, n)) return false;
+    nWorld = I.r0.xyz * n.x + I.r1.xyz * n.y + I.r2.xyz * n.z;
+    gLayer = I.albedo.w;
+    gInst = int(index);
+    return true;
+}
+
+// Whole scene. Returns the hit distance or -1; nWorld is the (unnormalised) surface normal.
+float traceScene(vec3 o, vec3 d, float tmax, bool anyHit, out vec3 nWorld)
+{
+    uint stack[TOP_STACK];
+    int sp = 0;
+    float best = tmax;
+    bool found = false;
+    vec3 inv = safeInv(d);
+    uint ni = 0u;
+    nWorld = vec3(0.0);
+    if (uCounts <= 0) return -1.0;
+    for (int guard = 0; guard < MAX_STEPS; guard++) {
+        Node nd = tlas[ni];
+        float t0 = boxEntry(nd.lo0, nd.hi0, o, inv, best);
+        float t1 = boxEntry(nd.lo1, nd.hi1, o, inv, best);
+        if (t0 >= 0.0 && nd.n0 > 0u) {
+            if (traceInstance(nd.c0, o, d, best, anyHit, nWorld)) { found = true; if (anyHit) return best; }
+            t0 = -1.0;
+        }
+        if (t1 >= 0.0 && nd.n1 > 0u) {
+            if (t1 < best && traceInstance(nd.c1, o, d, best, anyHit, nWorld)) { found = true; if (anyHit) return best; }
+            t1 = -1.0;
+        }
+        if (t0 >= best) t0 = -1.0;
+        if (t1 >= best) t1 = -1.0;
+        if (t0 >= 0.0 && t1 >= 0.0) {
+            if (t0 <= t1) { if (sp < TOP_STACK) { stack[sp++] = nd.c1; } else overflowed = 1u; ni = nd.c0; }
+            else { if (sp < TOP_STACK) { stack[sp++] = nd.c0; } else overflowed = 1u; ni = nd.c1; }
+            continue;
+        }
+        if (t0 >= 0.0) { ni = nd.c0; continue; }
+        if (t1 >= 0.0) { ni = nd.c1; continue; }
+        bool got = false;
+        while (sp > 0) {
+            sp--;
+            ni = stack[sp]; got = true; break;
+        }
+        if (!got) break;
+    }
+    return found ? best : -1.0;
+}
+
+// Colour of the surface the last closest-hit ray found, from its material texture.
+// lod: which mip level (0 = sharpest, 7 = the texture's average colour).
+float hitLayer()
+{
+    return gLayer >= 0.0 ? gLayer : float((gUv0 & 15u) | ((gUv1 & 15u) << 4) | ((gUv2 & 15u) << 8));
+}
+
+vec3 hitColour(float lod)
+{
+    float layer = hitLayer();
+    uint a = gUv0 >> 4, b = gUv1 >> 4, c = gUv2 >> 4;
+    if (a == b && b == c) return textureLod(uAlbedo, vec3(0.5, 0.5, layer), 7.0).rgb;    // no coordinates
+    vec2 uv = unpackUv(gUv0) * (1.0 - gBary.x - gBary.y) + unpackUv(gUv1) * gBary.x + unpackUv(gUv2) * gBary.y;
+    return textureLod(uAlbedo, vec3(uv, layer), lod).rgb;
+}
+
+// The sky as the game draws it, in direction d (see rt_sky_begin in rt_core.c for the layout).
+vec3 skyShown(vec3 d, float lod)
+{
+    if (uSkyGain.y < 0.5) return vec3(uSkyGain.zw, uFallback.w);
+    vec3 a = abs(d), f, u;
+    float face;
+    if (a.x >= a.y && a.x >= a.z) { face = d.x > 0.0 ? 0.0 : 1.0; f = vec3(d.x > 0.0 ? 1.0 : -1.0, 0.0, 0.0); u = vec3(0.0, 1.0, 0.0); }
+    else if (a.y >= a.z) { face = d.y > 0.0 ? 2.0 : 3.0; f = vec3(0.0, d.y > 0.0 ? 1.0 : -1.0, 0.0); u = vec3(0.0, 0.0, 1.0); }
+    else { face = d.z > 0.0 ? 4.0 : 5.0; f = vec3(0.0, 0.0, d.z > 0.0 ? 1.0 : -1.0); u = vec3(0.0, 1.0, 0.0); }
+    vec3 r = cross(f, u);
+    vec2 st = vec2(dot(d, r), dot(d, u)) / dot(d, f) * 0.5 + 0.5;
+    float edge = 0.5 * exp2(lod) / SKY_FACE;            // stay inside this view's texels
+    st = clamp(st, vec2(edge), vec2(1.0 - edge));
+    vec2 uv = (vec2(mod(face, 3.0), floor(face / 3.0)) + st) * vec2(1.0 / 3.0, 0.5);
+    return textureLod(uSkyAtlas, uv, lod).rgb;
+}
+
+// Light the sky sends from direction d.
+vec3 skyColour(vec3 d, float lod)
+{
+    if (uSkyGain.y < 0.5) return vec3(uSkyGain.zw, uFallback.w);
+    vec3 c = skyShown(d, lod) * uSkyGain.x;
+    // The sky texture is painted for looks and far more saturated than the light the game's
+    // artists chose; pull its hue towards theirs.
+    const vec3 LUM = vec3(0.3, 0.59, 0.11);
+    vec3 amb = vec3(uSkyGain.zw, uFallback.w);
+    vec3 hue = amb / max(dot(amb, LUM), 1e-3);
+    return mix(dot(c, LUM) * hue, c, uSkyTint.x);
+}
+
+// Light arriving from direction d when nothing is in the way: the sky, or below the
+// horizon the sea, which mostly mirrors the sky.
+vec3 openLight(vec3 o, vec3 d)
+{
+    if (uGi.z > 0.5 && d.y < -1e-4 && o.y > uGi.y)
+        return 0.35 * skyColour(vec3(d.x, -d.y, d.z), 3.0);
+    return skyColour(d, 3.0);
+}
+
+// Light leaving the surface the last closest-hit ray found, towards where the ray came
+// from: its colour times the sunlight and last frame's indirect light falling on it, plus
+// what it emits. o, rd, rt: the ray and the hit distance; rn: the normal traceScene gave.
+// lod: how blurred to read its texture.
+vec3 lastLight(vec3 p);
+float traceScene(vec3 o, vec3 d, float tmax, bool anyHit, out vec3 nWorld);
+vec3 surfaceLight(vec3 o, vec3 rd, float rt, vec3 rn, float lod)
+{
+    vec3 colour = hitColour(lod);
+    vec3 emit = mats[2 * int(hitLayer()) + 1].rgb;
+    vec3 skip;
+    rn = normalize(rn);
+    if (dot(rn, rd) > 0.0) rn = -rn;
+    vec3 hp = o + rd * rt + rn * (0.02 + 2e-4 * rt);
+    float nl = dot(rn, uSun);
+    vec3 arriving = lastLight(hp) + emit;
+    if (nl > 0.0 && traceScene(hp, uSun, 1e30, true, skip) < 0.0) arriving += uSunCol * (nl * cloudLight(hp));   // moss: clouds
+    return colour * arriving;
+}
+
+// Indirect light that reached world point p last frame, if p was on screen then.
+vec3 lastLight(vec3 p)
+{
+    if (uGi.x < 0.5) return uFallback.rgb;
+    vec4 clip = uPrevVP * vec4(p, 1.0);
+    if (clip.w <= 1e-4) return uFallback.rgb;
+    ivec2 size = imageSize(uPrevMask);
+    ivec2 q = ivec2(floor((clip.xy / clip.w * 0.5 + 0.5) * vec2(size)));
+    if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) return uFallback.rgb;
+    float expect = length(p - uPrevEye);
+    if (abs(imageLoad(uPrevMask, q).y - expect) > 0.02 * expect + 0.3) return uFallback.rgb;
+    return imageLoad(uPrevLight, q).rgb;
+}
+
+// Screen-space noise with no low frequencies, so a small blur removes it.
+float ign(vec2 p)
+{
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+vec3 octDecode(uint p)
+{
+    vec2 e = vec2(float(int(p << 16u) >> 16), float(int(p) >> 16)) * (1.0 / 32767.0);
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+// The smooth surface at the last closest hit (world point P, flat normal nf facing the viewer,
+// unit length). Returns false if its mesh has no normals. ns: the interpolated normal, on nf's
+// side. lift: how far to move P so that it lies on the curved surface the normals describe
+// rather than on the flat triangle (each corner's tangent plane pulls P up, weighted by the
+// barycentric coordinates; only ever outwards), which keeps rays from a point on a round
+// low-polygon shape from being blocked by the neighbouring triangles. size: the triangle's
+// longest edge.
+bool smoothSurface(vec3 P, vec3 nf, out vec3 ns, out vec3 lift, out float size)
+{
+    ns = nf; lift = vec3(0.0); size = 0.0;
+    if (gInst < 0) return false;
+    uvec4 q = nrms[gTri];
+    if (q.w == 0u) return false;
+    Inst I = insts[gInst];
+    mat3 w2o = transpose(mat3(I.r0.xyz, I.r1.xyz, I.r2.xyz));     // object = w2o * world + offset
+    mat3 o2w = inverse(w2o);
+    Tri t = tris[gTri];
+    vec3 po = w2o * P + vec3(I.r0.w, I.r1.w, I.r2.w);
+    float b1 = gBary.x, b2 = gBary.y, b0 = 1.0 - b1 - b2;
+    vec3 na = octDecode(q.x), nb = octDecode(q.y), nc = octDecode(q.z);
+    vec3 no = na * b0 + nb * b1 + nc * b2;
+    vec3 nw = I.r0.xyz * no.x + I.r1.xyz * no.y + I.r2.xyz * no.z;   // normals go by the inverse transpose
+    if (dot(nw, nw) < 1e-20) return false;
+    float side = dot(nw, nf) < 0.0 ? -1.0 : 1.0;                    // the side the viewer is on
+    ns = normalize(nw) * side;
+    na *= side; nb *= side; nc *= side;
+    vec3 A = t.v0, B = t.v0 + t.e1, C = t.v0 + t.e2;
+    vec3 off = -(b0 * min(dot(po - A, na), 0.0) * na + b1 * min(dot(po - B, nb), 0.0) * nb + b2 * min(dot(po - C, nc), 0.0) * nc);
+    lift = o2w * off;
+    vec3 e1 = o2w * t.e1, e2 = o2w * t.e2;
+    size = sqrt(max(dot(e1, e1), max(dot(e2, e2), dot(e2 - e1, e2 - e1))));
+    float l = length(lift);
+    if (l > 0.5 * size) lift *= 0.5 * size / l;                        // never far off the triangle
+    return true;
+}
+
+vec2 octEncode(vec3 n)
+{
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    vec2 e = n.xy;
+    if (n.z < 0.0) e = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return e;
+}
+
+#ifdef FX_PASS
+// ---- light from effects (fx.c, wumrt_fx.comp) ------------------------------------------
+// Compiled from this same file with FX_PASS defined, as its own dispatch after the main
+// trace: for every pixel the main trace found a surface for, one shadow ray towards a random
+// point on each of the (at most four) brightest effect lights. Runs only while there are
+// effect lights, so it costs nothing otherwise.
+struct FxLight { vec4 pr; vec4 col; };  // pr: world position, radius of the glowing ball; col: rgb intensity, w: reach
+layout(std430, binding = 8) readonly buffer FxBuf { FxLight fxl[]; };
+layout(rgba16f, binding = 1) uniform readonly image2D uGeom;     // the main trace's result: sun, distance, normal
+layout(rgba16f, binding = 3) uniform writeonly image2D uFxVis;   // visibility of shadowed lights 0..3
+uniform vec4 uFx;                       // x = lights, y = how many of them (the first) get shadow rays, z = noise seed
+
+vec3 octDecode2(vec2 e)
+{
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uFxVis);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+    vec4 g = imageLoad(uGeom, pix);
+    vec4 vis = vec4(1.0);
+    int nShadow = min(int(uFx.y), 4);
+    if (g.y < FAR - 1.0 && nShadow > 0) {
+        vec3 d = normalize(uBase + uDx * float(pix.x) + uDy * float(pix.y) - uEye);
+        vec3 n = octDecode2(g.zw);
+        vec3 p = uEye + d * g.y + n * (0.05 + 5e-4 * g.y);
+        vec3 unused;
+        for (int i = 0; i < 4; i++) {
+            if (i >= nShadow) break;
+            FxLight L = fxl[i];
+            vec3 v = L.pr.xyz - p;
+            float dist = length(v);
+            if (L.col.w <= 0.0 || dist >= L.col.w || dist < 1e-3) continue;
+            float r = L.pr.w;
+            // Faces turned fully away from the ball get nothing anyway: no ray.
+            if (dot(n, v) < -r) continue;
+            // A random point on the disc of the ball that faces this point; one ray per
+            // light per pixel, and the noise is averaged over time and space in wumrt_fx.comp.
+            vec3 w = v / dist;
+            vec3 u1 = normalize(cross(w, abs(w.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+            vec3 u2 = cross(w, u1);
+            float a = 6.2831853 * ign(vec2(pix) + float(i) * 17.31 + uFx.z * 5.588238);
+            float rr = 0.8 * r * sqrt(ign(vec2(pix.yx) + float(i) * 7.77 + uFx.z * 3.1623 + 11.0));
+            vec3 target = L.pr.xyz + u1 * (rr * cos(a)) + u2 * (rr * sin(a));
+            vec3 sd = target - p;
+            float len = length(sd);
+            // Stop short of the ball: its middle is often in the ground it was set off on.
+            float reach = len - 0.5 * r;
+            if (reach <= 0.05) continue;
+            if (traceScene(p, sd / len, reach, true, unused) > 0.0) vis[i] = 0.0;
+        }
+    }
+    imageStore(uFxVis, pix, vis);
+}
+#else
+
+// Whether last frame's accumulated indirect light covers the surface point p: the same test
+// the temporal pass makes (wumrt_temporal.comp). Only such pixels may skip their sky rays.
+bool hasHistory(vec3 p)
+{
+    vec4 clip = uPrevVP * vec4(p, 1.0);
+    if (clip.w <= 1e-4) return false;
+    ivec2 size = imageSize(uPrevMask);
+    vec2 pp = (clip.xy / clip.w * 0.5 + 0.5) * vec2(size) - 0.5;
+    ivec2 base = ivec2(floor(pp));
+    vec2 f = pp - vec2(base);
+    float expect = length(p - uPrevEye), tol = 0.02 * expect + 0.3, wsum = 0.0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            ivec2 q = base + ivec2(i, j);
+            if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+            vec4 pm = imageLoad(uPrevMask, q);
+            if (pm.w < 0.5 || abs(pm.y - expect) > tol) continue;
+            wsum += (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+        }
+    return wsum > 0.05;
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uMask);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    vec3 d = normalize(uBase + uDx * float(pix.x) + uDy * float(pix.y) - uEye);
+    vec3 n;
+    float t = traceScene(uEye, d, 1e30, false, n);
+    float vis = 1.0, dist = FAR;
+    vec2 nOut = vec2(0.0);
+    float sky = 1.0;
+    vec3 bounce = vec3(0.0);
+    vec3 spec = vec3(0.0);
+    float trans = 0.0;                      // light through thin skin (characters), see below
+    if (t > 0.0) {
+        dist = min(t, FAR);
+        float pLayer = hitLayer();
+        vec3 pColour = uReflect.y > 0.5 ? hitColour(1.0) : vec3(0.5);
+        n = normalize(n);
+        if (dot(n, d) > 0.0) n = -n;                    // face the camera
+        // Smooth normals (uReflect.w = 1): the surface the game shades is the curved one its
+        // vertex normals describe, not the flat triangles. Where the mesh has them, the sun
+        // test, the sky rays and the normal handed to the filters use the interpolated normal,
+        // and rays start from the curved surface; the small lift still follows the flat one.
+        vec3 ns = n, lift = vec3(0.0);
+        float triSize = 0.0;
+        bool smoothN = uReflect.w > 0.5 && smoothSurface(uEye + d * t, n, ns, lift, triSize);
+        vec3 nFlat = n;
+        vec3 p = uEye + d * t + lift + n * (0.02 + 2e-4 * t);  // lift off the surface
+        int samples = min(int(uParams.x), 64);     // constant cap: no loop may depend on a uniform alone
+        vec3 unused;
+        float chk = mats[2 * int(pLayer)].w;
+        bool skin = uChar.x > 0.5 && chk > 0.5 && chk < 2.5;
+        bool leaf = uLeaf.x > 0.5 && chk > 3.5 && chk < 4.5;
+        if ((skin || leaf) && dot(smoothN ? ns : n, uSun) <= 0.0) {
+            // Skin turned away from the sun (characters). From just under the surface, follow
+            // the sun's direction through the body to where it comes out: the length is how
+            // much body the light crosses to get here (light through thin parts), and whether
+            // the sun reaches that far side is the sun's visibility used by the light wrap,
+            // which needs to know about other things' shadows here too.
+            float eps = 0.02 + 2e-4 * t;
+            vec3 q = uEye + d * t - nFlat * eps;
+            vec3 hn;
+            gTmin = 3.0 * eps;
+            float th = traceScene(q, uSun, 1e30, false, hn);
+            gTmin = T_MIN;
+            if (th > 0.0) {
+                vec3 xp = q + uSun * (th + eps);
+                vis = traceScene(xp, uSun, 1e30, true, unused) > 0.0 ? 0.0 : 1.0;
+                trans = vis * exp(-th / (leaf ? uLeaf.y : uChar.y));
+                // Leaves keep the sun visibility the game's own shading expects for faces
+                // turned away from the sun (see below): the glow is added on top.
+                if (leaf) vis = 1.0;
+            } else if (leaf) {
+                // A single leaf card: nothing behind it towards the sun, it is lit through.
+                vis = 1.0;
+                trans = 1.0;
+            }
+        } else if (uReflect.w > 0.5 && dot(smoothN ? ns : n, uSun) <= 0.0) {
+            // Facing away from the sun: the game's own shading already gives no sunlight here
+            // and fades it out towards this edge, so a traced shadow would only add a jagged
+            // edge along the triangles (and the filters would spread it onto lit pixels).
+            vis = 1.0;
+        } else {
+        // A triangle that faces away from the sun while its smooth normal faces it lies on the
+        // lit side's edge of a round shape: its neighbours there would shadow it in steps that
+        // follow the triangles. Hits closer than about one triangle do not count for it.
+        if (smoothN && dot(n, uSun) <= 0.0) gTmin = max(T_MIN, triSize);
+        if (samples <= 1) {
+            vis = traceScene(p, uSun, 1e30, true, unused) > 0.0 ? 0.0 : 1.0;
+        } else {
+            // Sample points spread evenly over the sun (Vogel spiral), turned by a different
+            // angle on every pixel. The four outermost go first: if they agree, the pixel is
+            // fully lit or fully shadowed and the rest are skipped.
+            vec3 lu = normalize(cross(uSun, abs(uSun.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+            vec3 lv = cross(uSun, lu);
+            float phi = 6.2831853 * ign(vec2(pix) + uParams.z * 5.588238);
+            int probes = min(samples, 4);
+            float lit = 0.0;
+            for (int s = samples - 1; s >= 0; s--) {
+                float r = uParams.y * sqrt((float(s) + 0.5) / float(samples));
+                float a = float(s) * 2.39996323 + phi;
+                vec3 sd = normalize(uSun + lu * (r * cos(a)) + lv * (r * sin(a)));
+                if (traceScene(p, sd, 1e30, true, unused) < 0.0) lit += 1.0;
+                if (s == samples - probes && (lit == 0.0 || lit == float(probes))) {
+                    lit *= float(samples) / float(probes);
+                    break;
+                }
+            }
+            vis = lit / float(samples);
+        }
+        gTmin = T_MIN;
+        }
+        vis *= cloudLight(p);                            // moss: cloud shadows
+        if (smoothN) n = ns;                             // the sky rays and the filters use the smooth normal
+        nOut = octEncode(n);
+
+        // Sky visibility: short rays over the hemisphere above the surface, denser towards
+        // the normal (cosine weighted). The share that gets away is how open the point is.
+        int skyRays = min(int(uSkyParams.x), 64);
+        // Cheaper indirect light (uGiRate): far away a pixel covers little of the scene, so half
+        // the rays do; and with a rate of 2 or 4 only every 2nd or 4th block of 8 x 4 pixels
+        // (one GPU warp, so whole warps skip together) traces sky rays this frame, in turn. A
+        // pixel that skips keeps what the temporal pass accumulated (sky = -1 tells it so); a
+        // pixel with no history to keep traces anyway.
+        if (uGiRate.z > 0.0 && t > uGiRate.z && skyRays > 1) skyRays = (skyRays + 1) / 2;
+        bool skipGi = false;
+        if (skyRays > 0 && uGiRate.x > 1.5) {
+            int rate = uGiRate.x > 3.0 ? 4 : 2;
+            int phase = int(uGiRate.y) % rate;
+            int blk = rate == 2 ? (((pix.x >> 3) + (pix.y >> 2)) & 1) : ((pix.x >> 3) & 1) + 2 * ((pix.y >> 2) & 1);
+            skipGi = blk != phase && hasHistory(uEye + d * dist);
+        }
+        if (skipGi) {
+            sky = -1.0;
+        } else if (skyRays > 0) {
+            vec3 tu = normalize(cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+            vec3 tv = cross(n, tu);
+            float phi2 = 6.2831853 * ign(vec2(pix.yx) + 31.7 + uSkyParams.w * 5.588238);
+            float open = 0.0;
+            vec3 lit = vec3(0.0);
+            bool gather = uSkyParams.z > 0.5;
+            bool full = uSkyParams.z > 1.5;
+            for (int s = 0; s < skyRays; s++) {
+                float r2 = (float(s) + 0.5) / float(skyRays);
+                float r = sqrt(r2), a = float(s) * 2.39996323 + phi2;
+                vec3 sd = tu * (r * cos(a)) + tv * (r * sin(a)) + n * sqrt(1.0 - r2);
+                if (smoothN && dot(sd, nFlat) < 0.0) sd = reflect(sd, nFlat);
+                vec3 hn;
+                float ht = traceScene(p, sd, uSkyParams.y, !gather, hn);
+                if (ht < 0.0) {
+                    open += 1.0;
+                    if (full) lit += openLight(p, sd);
+                    continue;
+                }
+                if (!gather) continue;
+                // The ray found a surface. It sends on part of the light that falls on it:
+                // sunlight if the sun reaches it, and (full) the indirect light it had last
+                // frame, which is what makes light bounce more than once.
+                vec3 colour = min(hitColour(2.0), vec3(0.85));
+                vec3 emit = full ? mats[2 * int(hitLayer()) + 1].rgb : vec3(0.0);
+                hn = normalize(hn);
+                if (dot(hn, sd) > 0.0) hn = -hn;
+                float nl = dot(hn, uSun);
+                vec3 hp = p + sd * ht + hn * (0.02 + 2e-4 * ht);
+                vec3 arriving = vec3(0.0);
+                if (nl > 0.0 && traceScene(hp, uSun, 1e30, true, unused) < 0.0) arriving = (full ? uSunCol : vec3(1.0)) * (nl * cloudLight(hp));   // moss: clouds
+                if (full) arriving = (arriving + lastLight(hp)) * uGi.w + emit;
+                lit += colour * arriving;
+            }
+            sky = open / float(skyRays);
+            bounce = lit / float(skyRays);
+            // Contact shadow (characters): the worms come in as capsules (uCaps). How much of the
+            // sky each one hides from this point (cosine weighted, as a sphere of the capsule's
+            // radius at its nearest point would), fading out within uChar.w of its surface,
+            // darkens all of the point's sky light, twice over: stylised and free of noise, so
+            // the worms sit on the ground. Not on the characters themselves.
+            if (uChar.z != 0.0 && uNCaps > 0 && (mats[2 * int(pLayer)].w < 0.5 || mats[2 * int(pLayer)].w > 3.5)) {
+                float keep = 1.0;
+                for (int k = 0; k < 16; k++) {
+                    if (k >= uNCaps) break;
+                    mat4 cm = uCaps[k >> 1];
+                    vec4 ca = (k & 1) == 0 ? cm[0] : cm[2];
+                    vec3 cb = ((k & 1) == 0 ? cm[1] : cm[3]).xyz;
+                    vec3 ab = cb - ca.xyz;
+                    float h = clamp(dot(p - ca.xyz, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+                    vec3 v = ca.xyz + ab * h - p;
+                    float dd = length(v), cr = ca.w;
+                    // A point inside the capsule belongs to that worm (its goggles, hat, ...): skip.
+                    float occ = dd <= cr ? 0.0 : clamp(dot(n, v / dd), 0.0, 1.0) * (cr * cr) / (dd * dd);
+                    occ *= clamp(1.0 - (dd - cr) / uChar.w, 0.0, 1.0);
+                    keep *= 1.0 - min(occ, 1.0);
+                }
+                float cs = max(1.0 - uChar.z * min(2.0 * (1.0 - keep), 1.0), 0.0);
+                sky *= cs;
+                bounce *= cs;
+                // Sky light is only a small share of the light on open ground, so the same
+                // blob also takes part of the sun away there: a soft dark patch where a worm
+                // touches the ground, as in an animated film (its true shadow is traced as before).
+                if (uChar.z > 0.0) vis *= mix(1.0, cs, 0.7);
+                if (uChar.z < 0.0)                  // debug view (contact_shadow < 0): the occlusion as red light
+                    bounce = vec3(1.0 - keep, 0.0, 0.0) * 2.0;
+            }
+        }
+
+        // What the surface mirrors, if its material is glossy enough to show it: one ray
+        // in the mirror direction. A rougher material reads blurrier textures and sky
+        // instead of spreading rays, which keeps this free of noise.
+        if (uReflect.y > 0.5) {
+            vec4 m = mats[2 * int(pLayer)];
+            float cosv = max(dot(n, -d), 0.0);
+            vec3 f0 = mix(vec3(0.04), pColour, m.z);
+            vec3 fres = f0 + (1.0 - f0) * pow(1.0 - cosv, 5.0);
+            float gloss = (1.0 - m.x) * (1.0 - m.x);
+            vec3 weight = fres * gloss * mix(m.y, 1.0, m.z) * uReflect.z;
+            if (max(weight.r, max(weight.g, weight.b)) > 0.01) {
+                vec3 rd = reflect(d, n), rn;
+                float rt = traceScene(p, rd, 1e30, false, rn);
+                vec3 seen = rt < 0.0 ? skyShown(rd, m.x * 5.0) : surfaceLight(p, rd, rt, rn, m.x * 4.0);
+                spec = weight * seen;
+            }
+        }
+    }
+    // The sea is a flat mirror at a known height and is not part of the traced scene. Where
+    // the camera ray meets it before anything else, follow the mirrored ray: it shows the
+    // sky, or a surface lit by the sun and by last frame's indirect light.
+    vec4 refl = vec4(spec, -trans);         // a < 0: light through thin skin (characters)
+    if (uReflect.x > 0.5 && uGi.z > 0.5 && d.y < -1e-5 && uEye.y > uGi.y) {
+        float tw = (uGi.y - uEye.y) / d.y;
+        if (t < 0.0 || tw < t) {
+            vec3 pw = uEye + d * tw + vec3(0.0, 0.02 + 2e-4 * tw, 0.0);
+            vec3 rd = vec3(d.x, -d.y, d.z), rn;
+            float rt = traceScene(pw, rd, 1e30, false, rn);
+            refl = vec4(rt < 0.0 ? skyShown(rd, 0.0) : surfaceLight(pw, rd, rt, rn, 0.0), 1.0);
+        }
+    }
+    imageStore(uRefl, pix, refl);
+    imageStore(uMask, pix, vec4(vis, dist, nOut));
+    imageStore(uSky, pix, vec4(sky, bounce));
+}
+#endif

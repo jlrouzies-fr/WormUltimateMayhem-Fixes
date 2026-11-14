@@ -1,0 +1,5 @@
+LIBRARY glut32
+EXPORTS
+  glutHideWindow=stub_glut0
+  glutDestroyWindow=stub_glut1
+  __glutCreateWindowWithExit=stub_glut2

@@ -1,0 +1,134 @@
+#version 430
+// Atmospheric depth (atmos.c), on the scene texture before the tone curve. Every loop has a
+// constant bound.
+//
+// PASS 1 SKY    one work group: mean linear colour of the sky pixels (nothing hit in the traced
+//               mask), weighted towards the horizon, smoothed over time -> 1x1 image (the haze colour)
+// PASS 2 APPLY  per pixel: blend towards the haze colour by eye distance (aerial perspective),
+//               more low down (height haze); optional sun shafts: 16 taps of open sky towards
+//               the sun's screen position.
+//
+// The scene texture holds sRGB-encoded colour (gamma 2.2 approximation); with hdr = 1 it is
+// RGBA16F and may go above 1.
+
+#ifndef PASS
+#define PASS 2
+#endif
+
+#if PASS == 1
+layout(local_size_x = 64) in;
+#else
+layout(local_size_x = 8, local_size_y = 8) in;
+#endif
+
+const float FAR = 60000.0;
+
+uniform vec4 uSize;     // scene width, height, 1/width, 1/height
+uniform vec4 uMask;     // mask width, height
+uniform vec3 uEye;      // camera position (world)
+uniform vec3 uBase;     // ray direction at uv (0, 0); + u * uDx + v * uDy (not normalised)
+uniform vec3 uDx;
+uniform vec3 uDy;
+uniform vec4 uAtmos;    // strength (most haze), start distance, distance scale, height scale
+uniform vec4 uAtmos2;   // base height, how much height matters (0..1), shafts strength, time smoothing
+uniform vec4 uSun;      // sun uv, on (1/0), shaft length (share of the way to the sun)
+uniform vec4 uSunCol;   // sun colour (max 1), fallback weight
+uniform vec4 uFallback; // haze colour when no sky has been seen yet (linear)
+
+layout(binding = 1) uniform sampler2D uMaskTex;
+layout(rgba32f, binding = 2) uniform image2D uFog;
+
+vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+vec3 toGamma(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
+
+float maskDist(vec2 uv)
+{
+    ivec2 m = clamp(ivec2(uv * uMask.xy), ivec2(0), ivec2(uMask.xy) - 1);
+    return texelFetch(uMaskTex, m, 0).y;
+}
+bool isSky(float d) { return d <= 0.0 || d >= FAR * 0.9; }
+
+#if PASS == 1
+#ifdef OUT_RGBA8
+layout(rgba8, binding = 0) uniform readonly image2D uScene;
+#else
+layout(rgba16f, binding = 0) uniform readonly image2D uScene;
+#endif
+shared vec4 sAcc[64];
+void main()
+{
+    uint i = gl_LocalInvocationID.x;
+    vec4 acc = vec4(0.0);
+    for (int k = 0; k < 4; k++) {
+        uint j = i * 4u + uint(k);
+        vec2 uv = (vec2(float(j & 15u), float(j >> 4)) + 0.5) / 16.0;
+        float d = maskDist(uv);
+        if (isSky(d)) {
+            vec3 dir = normalize(uBase + uv.x * uDx + uv.y * uDy);
+            float w = 1.0 - clamp(abs(dir.y) * 2.0, 0.0, 0.9);      // the horizon counts most
+            vec3 c = toLinear(imageLoad(uScene, ivec2(uv * uSize.xy)).rgb);
+            c = min(c, vec3(4.0));                                  // the sun's disc must not dominate
+            acc += vec4(c * w, w);
+        }
+    }
+    sAcc[i] = acc;
+    barrier();
+    if (i == 0u) {
+        vec4 s = vec4(0.0);
+        for (int k = 0; k < 64; k++) s += sAcc[k];
+        vec4 prev = imageLoad(uFog, ivec2(0));
+        vec3 col = prev.w > 0.5 ? prev.rgb : uFallback.rgb;
+        if (s.w > 0.5) {
+            vec3 now = s.rgb / s.w;
+            col = prev.w > 0.5 ? mix(prev.rgb, now, uAtmos2.w) : now;
+            prev.w = 1.0;
+        }
+        imageStore(uFog, ivec2(0), vec4(col, prev.w));
+    }
+}
+#else
+#ifdef OUT_RGBA8
+layout(rgba8, binding = 0) uniform image2D uScene;
+#else
+layout(rgba16f, binding = 0) uniform image2D uScene;
+#endif
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(uSize.x) || p.y >= int(uSize.y)) return;
+    vec2 uv = (vec2(p) + 0.5) * uSize.zw;
+    float d = maskDist(uv);
+    bool sky = isSky(d);
+    vec4 src = imageLoad(uScene, p);
+    vec3 c = toLinear(src.rgb);
+    vec4 fog = imageLoad(uFog, ivec2(0));
+    vec3 haze = fog.w > 0.5 ? fog.rgb : uFallback.rgb;
+    bool changed = false;
+    if (!sky && uAtmos.x > 0.0) {
+        vec3 dir = normalize(uBase + uv.x * uDx + uv.y * uDy);
+        float y = uEye.y + dir.y * d;
+        float far = 1.0 - exp(-max(d - uAtmos.y, 0.0) / max(uAtmos.z, 1.0));
+        float low = exp(-max(y - uAtmos2.x, 0.0) / max(uAtmos.w, 1.0));
+        float f = uAtmos.x * far * mix(1.0, low, clamp(uAtmos2.y, 0.0, 1.0));
+        c = mix(c, haze, clamp(f, 0.0, 1.0));
+        changed = true;
+    }
+    if (uAtmos2.z > 0.0 && uSun.z > 0.5) {
+        // sun shafts: how much open sky lies between this pixel and the sun on screen
+        vec2 to = (uSun.xy - uv) * uSun.w;
+        float open = 0.0;
+        for (int k = 0; k < 16; k++) {
+            vec2 q = uv + to * ((float(k) + 0.5) / 16.0);
+            if (q.x > 0.0 && q.x < 1.0 && q.y > 0.0 && q.y < 1.0 && isSky(maskDist(q))) open += 1.0;
+        }
+        open /= 16.0;
+        vec2 ds = (uv - uSun.xy) * vec2(uSize.x * uSize.w, 1.0);
+        float fall = exp(-dot(ds, ds) * 6.0);
+        // only where the line to the sun is partly blocked: shafts, not a flat glow
+        float shaft = open * (1.0 - open) * 4.0 * fall;
+        c += uSunCol.rgb * haze * uAtmos2.z * shaft;
+        changed = true;
+    }
+    if (changed) imageStore(uScene, p, vec4(toGamma(c), src.a));
+}
+#endif

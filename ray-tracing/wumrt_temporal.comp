@@ -1,0 +1,99 @@
+#version 430
+// Accumulates what the tracer produced over time, before any blurring: the sun visibility,
+// the sky visibility and the indirect light. Each pixel's surface point is looked up where
+// it was on screen last frame; if the same surface was there, the old value is blended with
+// the new one. How many frames a pixel has been accumulating is kept with it: a pixel that
+// just came into view takes the new value outright, then averages, and only later settles
+// into a slow blend. It also keeps how much the indirect light varies from frame to frame,
+// which tells the filter passes how much blurring a pixel still needs.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, binding = 1) uniform readonly image2D uSrc;         // this frame: sun visibility, distance, normal
+layout(rgba16f, binding = 2) uniform readonly image2D uSkySrc;      // this frame: sky visibility, indirect light (rgb)
+layout(rgba16f, binding = 4) uniform readonly image2D uPrevAcc;     // last frame's uAcc
+layout(rgba16f, binding = 5) uniform readonly image2D uPrevMask;    // last frame's result: x sun, y distance, w frames accumulated
+layout(rgba16f, binding = 6) uniform readonly image2D uPrevMom;     // last frame's uMom
+layout(rgba16f, binding = 0) uniform writeonly image2D uAcc;        // sky visibility, indirect light, accumulated
+layout(rgba16f, binding = 3) uniform writeonly image2D uMom;        // x, y = mean and mean square of the light's brightness, z = sun visibility accumulated, w = frames accumulated
+layout(rgba16f, binding = 7) uniform writeonly image2D uVar;        // indirect light, and the variance left in it (for the filter passes)
+
+uniform vec3 uEye, uBase, uDx, uDy;     // ray through pixel (x, y): uBase + x*uDx + y*uDy - uEye
+uniform vec4 uHist;                     // x = smallest share the new frame gets, y = 1 if last frame's images can be used, z = smallest share for the sun
+uniform mat4 uPrevVP;                   // last frame's view * projection
+uniform vec3 uPrevEye;
+
+const float FAR = 60000.0;
+const float MAX_HISTORY = 64.0;
+const vec3 LUM = vec3(0.3, 0.59, 0.11);
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uAcc);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    vec4 c = imageLoad(uSrc, pix);
+    vec4 cur = imageLoad(uSkySrc, pix);
+    // No sky rays traced here this frame (gi_rate): keep the accumulated value as it is.
+    // The tracer only skips where it found history, so the fallback below is for safety.
+    bool skipped = cur.x < -0.5;
+    if (skipped) cur = vec4(1.0, 0.0, 0.0, 0.0);
+    float lum = dot(cur.yzw, LUM);
+    float frames = 0.0, sun = c.x;
+    vec4 result = cur;
+    vec2 mom = vec2(lum, lum * lum);
+    if (c.y < FAR - 1.0 && uHist.y > 0.5) {
+        vec3 p = uEye + normalize(uBase + uDx * float(pix.x) + uDy * float(pix.y) - uEye) * c.y;
+        vec4 clip = uPrevVP * vec4(p, 1.0);
+        if (clip.w > 1e-4) {
+            // Where the point was last frame, between four pixel centres. Each of the four
+            // counts only if it showed the same surface (same distance from the old eye).
+            vec2 pp = (clip.xy / clip.w * 0.5 + 0.5) * vec2(size) - 0.5;
+            ivec2 base = ivec2(floor(pp));
+            vec2 f = pp - vec2(base);
+            float expect = length(p - uPrevEye);
+            float tol = 0.02 * expect + 0.3;
+            vec4 sum = vec4(0.0), msum = vec4(0.0);
+            float wsum = 0.0;
+            for (int j = 0; j < 2; j++)
+                for (int i = 0; i < 2; i++) {
+                    ivec2 q = base + ivec2(i, j);
+                    if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+                    vec4 pm = imageLoad(uPrevMask, q);
+                    if (pm.w < 0.5 || abs(pm.y - expect) > tol) continue;
+                    float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+                    sum += imageLoad(uPrevAcc, q) * w;
+                    msum += imageLoad(uPrevMom, q) * w;
+                    wsum += w;
+                }
+            if (wsum > 0.05) {
+                msum /= wsum;
+                frames = msum.w;
+                float share = skipped ? 0.0 : max(1.0 / (frames + 1.0), uHist.x);
+                result = mix(sum / wsum, cur, share);
+                mom = mix(msum.xy, mom, share);
+                // The sun's shadow moves with whatever casts it, and nothing here knows how
+                // casters move. So the old value may only stay within what this pixel's
+                // neighbourhood shows now: a shadow that has left cannot linger.
+                float lo = c.x, hi = c.x;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        ivec2 q = clamp(pix + ivec2(dx, dy), ivec2(0), size - 1);
+                        float v = imageLoad(uSrc, q).x;
+                        lo = min(lo, v); hi = max(hi, v);
+                    }
+                sun = mix(clamp(msum.z, lo, hi), c.x, max(1.0 / (frames + 1.0), uHist.z));
+            }
+        }
+    }
+    if (!skipped || frames < 1.0) frames = min(frames + 1.0, MAX_HISTORY);
+    // Variance of one frame's value, from the two means; with little history that is not
+    // known yet, so assume a lot. Averaging n frames leaves a n-th of it.
+    float variance = max(mom.y - mom.x * mom.x, 0.0);
+    float mean = dot(result.yzw, LUM);
+    if (frames < 4.0) variance = max(variance, 0.25 * mean * mean);
+    variance /= min(frames, 1.0 / max(uHist.x, 1.0 / MAX_HISTORY));
+    imageStore(uAcc, pix, result);
+    imageStore(uMom, pix, vec4(mom, sun, frames));
+    imageStore(uVar, pix, vec4(result.yzw, variance));
+}

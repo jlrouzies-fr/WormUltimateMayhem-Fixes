@@ -1,0 +1,76 @@
+#version 430
+// Smooths the sun visibility and the sky visibility that the temporal pass accumulated.
+// Neighbours only count if they lie on the same surface: similar normal, and close to this
+// pixel's surface plane. Pixels that have only just come into view have little accumulated
+// and get a wider blur of the sky visibility. (The indirect light has its own filter passes,
+// wumrt_atrous.comp.)
+// Output: x = sun visibility, y = distance from the eye (unchanged), z = sky visibility,
+// w = frames accumulated.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, binding = 1) uniform readonly image2D uSrc;     // sun visibility, distance, normal (this frame)
+layout(rgba16f, binding = 2) uniform readonly image2D uSkySrc;  // sky visibility (x), accumulated
+layout(rgba16f, binding = 4) uniform readonly image2D uMom;     // z = sun visibility accumulated, w = frames accumulated
+layout(rgba16f, binding = 0) uniform writeonly image2D uDst;
+
+uniform vec3 uEye, uBase, uDx, uDy;     // ray through pixel (x, y): uBase + x*uDx + y*uDy - uEye
+uniform vec4 uParams;                   // x = blur radius for the sun, y = for the sky (pixels, 0 = none)
+
+const float FAR = 60000.0;
+
+vec3 octDecode(vec2 e)
+{
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+vec3 pointAt(ivec2 p, float t)
+{
+    return uEye + normalize(uBase + uDx * float(p.x) + uDy * float(p.y) - uEye) * t;
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uDst);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    vec4 c = imageLoad(uSrc, pix);
+    if (c.y >= FAR - 1.0) {
+        imageStore(uDst, pix, vec4(c.xy, 1.0, 0.0));
+        return;
+    }
+    vec4 m = imageLoad(uMom, pix);
+    float frames = m.w;
+    vec3 nc = octDecode(c.zw);
+    vec3 pc = pointAt(pix, c.y);
+    float tol = 0.004 * c.y + 0.03;     // how far off this pixel's plane a neighbour may be
+    int rSun = int(uParams.x), rSky = int(uParams.y);
+    if (rSky > 0) rSky = frames < 4.0 ? rSky + 3 : frames < 12.0 ? rSky + 1 : rSky;
+    int rad = min(max(rSun, rSky), 16);       // constant cap
+    float sum = m.z, wsum = 1.0, skyW = 1.0;
+    float skySum = imageLoad(uSkySrc, pix).x;
+    for (int dy = -rad; dy <= rad; dy++)
+        for (int dx = -rad; dx <= rad; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 q = pix + ivec2(dx, dy);
+            if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+            vec4 s = imageLoad(uSrc, q);
+            if (s.y >= FAR - 1.0) continue;
+            if (dot(octDecode(s.zw), nc) < 0.9) continue;
+            if (abs(dot(pointAt(q, s.y) - pc, nc)) > tol) continue;
+            float d2 = float(dx * dx + dy * dy);
+            if (abs(dx) <= rSun && abs(dy) <= rSun) {
+                float w = exp(-d2 / (0.6 * float(rSun * rSun) + 0.5));
+                sum += imageLoad(uMom, q).z * w;
+                wsum += w;
+            }
+            if (abs(dx) <= rSky && abs(dy) <= rSky) {
+                float w = exp(-d2 / (0.8 * float(rSky * rSky) + 0.5));
+                skySum += imageLoad(uSkySrc, q).x * w;
+                skyW += w;
+            }
+        }
+    imageStore(uDst, pix, vec4(sum / wsum, c.y, skySum / skyW, frames));
+}

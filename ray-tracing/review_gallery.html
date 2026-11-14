@@ -1,0 +1,160 @@
+<title>WUM Render Review</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap">
+<style>
+/* Layout: a grading-suite light table. Milestone tabs on top; per level a block of rows,
+   one row per camera view, the presets side by side; click any frame for a full-size
+   viewer where 1 / 2 / 3 flip between presets of the same frame. Deliberately one dark look. */
+:root {
+  color-scheme: dark;
+  --ground: #121416;
+  --panel: #1a1d20;
+  --line: #2a2f34;
+  --text: #e8e6e1;
+  --muted: #9aa0a6;
+  --accent: #f2b544;        /* slate-marker amber */
+  --stock: #8fa3b8;
+  --baseline: #c9a36b;
+  --current: #7fc8a0;
+  --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --body: "Inter", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", Consolas, monospace;
+}
+body { background: var(--ground); color: var(--text); font: 14px/1.5 var(--body); }
+.wrap { max-width: 1500px; margin: 0 auto; padding-block: 24px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+header { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding-bottom: 16px; }
+h1 { font: 600 34px/1 var(--display); letter-spacing: .02em; margin: 0; text-wrap: balance; }
+h1 span { color: var(--accent); }
+.sub { color: var(--muted); margin: 6px 0 0; max-width: 70ch; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tabs button { font: 500 13px var(--body); color: var(--muted); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 999px; padding: 6px 14px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { color: var(--ground); background: var(--accent); border-color: var(--accent); }
+.tabs button:focus-visible, .frame:focus-visible, .viewer button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 16px 0 8px; color: var(--muted); font-size: 13px; }
+.meta b { color: var(--text); font-weight: 500; }
+.notes { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; margin: 8px 0 0; white-space: pre-wrap; font: 12px/1.6 var(--mono); color: var(--muted); max-width: 100%; overflow-x: auto; }
+section.level { margin-top: 36px; }
+section.level h2 { font: 600 24px/1.1 var(--display); letter-spacing: .03em; margin: 0 0 4px; }
+section.level h2 small { font: 400 13px var(--body); color: var(--muted); letter-spacing: 0; margin-left: 10px; }
+.row { display: grid; grid-template-columns: 70px repeat(var(--cols), minmax(0, 1fr)); gap: 8px; align-items: start; margin-top: 10px; }
+.row .vname { font: 600 15px/1 var(--display); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); padding-top: 24px; }
+.frame { display: block; border: 0; padding: 0; background: none; cursor: zoom-in; text-align: left; color: inherit; min-width: 0; }
+.frame img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: var(--panel); border-radius: 3px; }
+.tag { display: inline-flex; align-items: center; gap: 6px; font: 500 11px var(--body); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+.tag i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.empty { color: var(--muted); padding: 40px 0; }
+.viewer { position: fixed; inset: 0; background: rgba(8, 9, 10, .96); display: flex; flex-direction: column; z-index: 20;
+  padding: calc(12px + env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) calc(12px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px)); }
+.viewer .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.viewer .title { font: 600 18px var(--display); letter-spacing: .03em; margin-right: auto; }
+.viewer button { font: 500 13px var(--body); color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 6px 12px; cursor: pointer; }
+.viewer button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.viewer .stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; margin-top: 10px; }
+.viewer .stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.viewer .hint { color: var(--muted); font-size: 12px; text-align: center; margin-top: 6px; }
+@media (max-width: 700px) {
+  .row { grid-template-columns: repeat(var(--cols), minmax(0, 1fr)); }
+  .row .vname { grid-column: 1 / -1; padding-top: 6px; }
+}
+@media (prefers-reduced-motion: no-preference) { .frame img { transition: opacity .15s; } .frame:hover img { opacity: .88; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>WUM Render Review <span>/</span> film-look push</h1>
+      <p class="sub">Each row is one paused frame from one match: the stock game, main before the parallel streams, and main at that milestone, swapped live in the same frame. Traced at half the shot's resolution, HUD hidden.</p>
+    </div>
+    <nav class="tabs" id="tabs" aria-label="Milestones"></nav>
+  </header>
+  <div id="meta" class="meta"></div>
+  <div id="levels"><p class="empty">Loading the review sets...</p></div>
+</div>
+
+<div class="viewer" id="viewer" hidden role="dialog" aria-modal="true" aria-label="Full-size frame">
+  <div class="bar">
+    <div class="title" id="vtitle"></div>
+    <div id="vpresets" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+    <button id="vclose">Close</button>
+  </div>
+  <div class="stage"><img id="vimg" alt=""></div>
+  <div class="hint">1 / 2 / 3 or the buttons flip between presets of this frame &middot; left / right arrows: other views &middot; Esc closes</div>
+</div>
+
+<script>
+const PRESET_LABEL = { stock: "Stock game", baseline: "Baseline: main before the streams", current: "Current main" };
+const PRESET_COLOR = { stock: "var(--stock)", baseline: "var(--baseline)", current: "var(--current)" };
+let data = null, ms = null, viewer = null;
+
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "style") e.style.cssText = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+  }
+  for (const k of kids) e.append(k);
+  return e;
+}
+
+function frames() {            // every frame of the milestone in page order
+  const out = [];
+  for (const lv of ms.levels) for (const v of lv.views) out.push({ lv, v });
+  return out;
+}
+
+function render() {
+  const tabs = document.getElementById("tabs");
+  tabs.replaceChildren(...data.milestones.map(m => el("button", { "aria-pressed": String(m === ms), onclick: () => { location.hash = m.id; } }, m.label)));
+  const meta = document.getElementById("meta");
+  meta.replaceChildren(el("span", {}, "Shot ", el("b", {}, ms.time)), el("span", {}, "Resolution ", el("b", {}, ms.res || "?")), el("span", {}, "Presets ", el("b", {}, ms.presets.map(p => PRESET_LABEL[p] || p).join(" | "))));
+  if (ms.notes) meta.append(el("div", { class: "notes", style: "flex-basis:100%" }, ms.notes));
+  const root = document.getElementById("levels");
+  root.replaceChildren(...ms.levels.map(lv => el("section", { class: "level" },
+    el("h2", {}, lv.name, el("small", {}, lv.look || "")),
+    ...lv.views.map(v => {
+      const row = el("div", { class: "row", style: `--cols:${ms.presets.length}` }, el("div", { class: "vname" }, v.id));
+      for (const p of ms.presets) {
+        const f = v.images[p];
+        row.append(el("button", { class: "frame", onclick: () => open(lv, v, p), "aria-label": `${lv.name}, ${v.id}, ${PRESET_LABEL[p] || p}` },
+          el("span", { class: "tag" }, el("i", { style: `background:${PRESET_COLOR[p] || "var(--muted)"}` }), PRESET_LABEL[p] || p),
+          f ? el("img", { src: f.thumb, alt: `${lv.name} ${v.id} ${p}`, loading: "lazy" }) : el("div", { class: "empty" }, "not shot")));
+      }
+      return row;
+    }))));
+}
+
+function open(lv, v, p) { viewer = { lv, v, p }; showViewer(); document.getElementById("viewer").hidden = false; }
+function showViewer() {
+  const { lv, v, p } = viewer;
+  document.getElementById("vtitle").textContent = `${lv.name} - ${v.id}`;
+  document.getElementById("vpresets").replaceChildren(...ms.presets.map((q, i) =>
+    el("button", { "aria-pressed": String(q === p), onclick: () => { viewer.p = q; showViewer(); } }, `${i + 1}  ${PRESET_LABEL[q] || q}`)));
+  const f = v.images[p];
+  const img = document.getElementById("vimg");
+  img.src = f ? f.full : ""; img.alt = `${lv.name} ${v.id} ${p}`;
+}
+function closeViewer() { document.getElementById("viewer").hidden = true; viewer = null; }
+document.getElementById("vclose").addEventListener("click", closeViewer);
+document.addEventListener("keydown", e => {
+  if (!viewer) return;
+  if (e.key === "Escape") closeViewer();
+  const n = parseInt(e.key, 10);
+  if (n >= 1 && n <= ms.presets.length) { viewer.p = ms.presets[n - 1]; showViewer(); }
+  if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+    const all = frames(), i = all.findIndex(x => x.v === viewer.v);
+    const j = (i + (e.key === "ArrowRight" ? 1 : all.length - 1)) % all.length;
+    viewer.lv = all[j].lv; viewer.v = all[j].v; showViewer();
+  }
+});
+
+function pick() {
+  const id = location.hash.slice(1);
+  ms = data.milestones.find(m => m.id === id) || data.milestones[data.milestones.length - 1];
+  render();
+}
+window.addEventListener("hashchange", pick);
+fetch("gallery.json").then(r => r.json()).then(j => { data = j; pick(); })
+  .catch(() => { document.getElementById("levels").replaceChildren(el("p", { class: "empty" }, "The review sets could not be loaded.")); });
+</script>
