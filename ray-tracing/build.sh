@@ -21,7 +21,7 @@ link() {
     -Xlinker -Brepro -lopengl32 -lgdi32 -luser32
 }
 link loader.c -o build/glut32.dll -Xlinker /def:wumrt.def
-link -DWUMRT_CORE wumrt.c rt_core.c bvh.c fx.c post.c atmos.c -o build/wumrt_core.dll
+link -DWUMRT_CORE wumrt.c rt_core.c bvh.c fx.c post.c atmos.c motion.c -o build/wumrt_core.dll
 cp build/wumrt_core.dll "$SB/wumrt_core.dll"
 if cmp -s build/glut32.dll "$SB/glut32.dll"; then
   :
@@ -30,5 +30,5 @@ elif cp build/glut32.dll "$SB/glut32.dll" 2>/dev/null; then
 else
   echo "loader changed but glut32.dll is in use: stop the game (python sandbox.py stop) and build again"
 fi
-cp wumrt_trace.comp wumrt_filter.comp wumrt_temporal.comp wumrt_atrous.comp wumrt_fx.comp wumrt_post.comp wumrt_atmos.comp wumrt_materials.ini wumrt_surfaces.ini wumrt_characters.ini wumrt_grades.ini "$SB/"
+cp wumrt_trace.comp wumrt_filter.comp wumrt_temporal.comp wumrt_atrous.comp wumrt_fx.comp wumrt_post.comp wumrt_atmos.comp wumrt_motion.comp wumrt_materials.ini wumrt_surfaces.ini wumrt_characters.ini wumrt_grades.ini "$SB/"
 echo built

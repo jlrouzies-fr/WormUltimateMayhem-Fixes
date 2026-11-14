@@ -26,6 +26,7 @@
 #include "rt.h"
 #include "post.h"
 #include "atmos.h"
+#include "motion.h"         /* motion-blur stream: camera motion blur */
 
 #define GL_COMPUTE_SHADER 0x91B9
 #define GL_COMPILE_STATUS 0x8B81
@@ -516,6 +517,8 @@ static void run_dof(void)
     u32 mw = 0, mh = 0, vw = 0, vh = 0;
     int o8;
     F.dof_done = 1;
+    if (motion_wanted() && ready() && find_scene_texture())         /* motion-blur stream: camera motion blur */
+        motion_apply(G.scene_tex, G.sw, G.sh, !is_float_fmt(G.sfmt));  /* (motion.c), before the depth of field */
     if (S.dof <= 0 || !ready() || !find_scene_texture()) return;
     mask = rt_post_mask(&mw, &mh, &vw, &vh);
     if (!mask || !mw || !mh || !vw || !vh) return;

@@ -22,6 +22,7 @@
 #include "wumrt_api.h"
 #include "fx.h"
 #include "atmos.h"
+#include "motion.h"
 #include "post.h"
 
 /* ---- import table slots in WormsMayhem.exe ---------------------------------- */
@@ -1726,6 +1727,7 @@ static void on_frame_end(HDC hdc)
             rt_reload_materials();
             post_reload();
             atmos_forget();
+            motion_forget();
             ctl->result = 0;
             ctl->ack_seq = ctl->cmd_seq;
         } else if (ctl->cmd == CMD_PACING) {
@@ -1775,6 +1777,7 @@ static void on_frame_end(HDC hdc)
     shell_draws = shell_verts = 0;
     fx_frame_end();
     atmos_frame_end();
+    motion_frame_end();
     post_frame_end();
     round_frame_end();
     chars_frame_end();
@@ -1901,6 +1904,7 @@ static void read_settings(void)
     if (!f) return;
     fx_setting(NULL, 0);
     atmos_setting(NULL, 0);
+    motion_setting(NULL, 0);
     post_settings_begin();
     smoke_settings_begin();
     round_settings_begin();
@@ -1911,6 +1915,7 @@ static void read_settings(void)
         if (!strcmp(name, "rt")) on = v != 0;
         else if (!strncmp(name, "fx", 2)) fx_setting(name, v);
         else if (!strncmp(name, "atmos", 5)) atmos_setting(name, v);
+        else if (!strncmp(name, "motion_blur", 11)) motion_setting(name, v);
         else if (!strcmp(name, "samples")) samples = (int)v;
         else if (!strcmp(name, "radius")) radius = v;
         else if (!strcmp(name, "filter")) filter = (int)v;

@@ -1100,6 +1100,44 @@ Captures: `captures/atmos_apple_core_night_480.png`, `captures/atmos_random_leve
 (off / on / 0.7). Tested from a free camera pulled back 350 units and raised 150 units.
 `atmos_test.sh NAME` runs the batch.
 
+## Camera motion blur
+
+When the camera pans, flies or shakes, the scene smears softly along the motion, like a film
+camera's shutter; a camera that holds still changes nothing (`motion_blur = 0.5` is a 180 degree
+shutter: the smear is half of the frame-to-frame motion; 0 = off, the default in code). `motion.c`
+runs `wumrt_motion.comp` on the game's scene texture from post.c's `run_dof`, right after the lit
+scene, so it needs `post = 1` and the tracer. Particles, name labels and the HUD are drawn later
+and stay sharp.
+
+- Motion vectors are the camera's only: each pixel's surface point (eye distance from the
+  tracer's mask) projected with this and last frame's camera. Both ends are projected from the
+  same point, so a camera that holds still gives exactly zero, and when the camera matrices are
+  unchanged the pass does not run at all (a paused, held frame is untouched).
+- A surface that was not there last frame (something farther was, in last frame's mask, in all
+  four nearest texels) moved by itself, e.g. a fast shell or worm the camera follows: it is not
+  smeared and does not bleed into its neighbours. Slow movers (walking worms) get the camera's
+  smear, about a pixel.
+- Gather: up to 16 taps along the pixel's own smear (box shutter, jittered). A nearer tap only
+  counts where its own smear reaches this pixel, so the foreground does not bleed onto the
+  background behind it.
+- A camera cut (turn over `motion_blur_cut` degrees, default 20, or a jump over
+  `motion_blur_jump` world units, default 400) gives no blur that frame.
+- Settings: `motion_blur` (shutter), `motion_blur_max` (longest smear, share of the view
+  height, default 0.04), `motion_blur_taps` (2..16, default 12), `motion_blur_log` (runs, still
+  and cut frames, GPU time every 300 frames), `motion_blur_split` (1 = only the right half is
+  smeared: an A/B check inside one moving frame).
+- Checking it: a still screenshot shows nothing by design. `py -3 mb_shot.py --free OUT.png 1.5 0 8`
+  turns the free camera 1.5 degrees every frame for 8 frames and shoots during the turn (with
+  `motion_blur_split = 1` the left half is the "off" picture); `mb_shot.py OUT.png DX DY` turns
+  the game camera with the mouse instead (only when the human player's camera listens).
+- Measured (480x270, Apple Core): 0.017 ms GPU per blurred frame; with the camera held, 0 of 299
+  frames ran the pass. Captures (stream copy): `captures/mb_free_split.png` (1.5 deg/frame
+  turn, right half blurred), `mb_free_after.png` (same view held), `mb_fast_split.png`
+  (4 deg/frame), `mb_move_split.png` (sideways move), `mb_turn_crop_compare.png`.
+- Not verified: in play with the game's own camera moves and shakes, 1080p, and how the uneven
+  frame pacing (50 Hz camera ticks vs the frame rate) makes the smear length vary from frame to
+  frame.
+
 ## Textures
 
 The game's textures are tiny (mostly 128 x 128). `wumrt_textures/` in the sandbox replaces
