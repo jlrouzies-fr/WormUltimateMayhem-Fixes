@@ -188,6 +188,8 @@ void rt_reload_materials(void);
 void rt_set_light(const float *sun_rgb, const float *ambient_rgb);
 /* The sea: a horizontal plane at this height (world y). Called when the game draws it. */
 void rt_set_water(float height);
+/* The direction towards the sun the tracer used last (for the sea's glints). */
+void rt_water_sun(float *s);
 /* Size (bounding-box diagonal, object space) of the vertex buffer a draw uses; 0 if unknown. */
 float rt_mesh_extent(const struct rt_draw *d);
 /* The sky is copied into six square views around the camera by drawing the game's own sky

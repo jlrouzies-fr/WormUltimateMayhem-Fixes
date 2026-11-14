@@ -170,6 +170,7 @@ gi_far = 0      # > 0: half the sky rays beyond this distance (world units)
 denoise = 3     # filter passes for the indirect light (1..5); each reaches twice as far as the last
 reflections = 1 # traced reflections in the sea (0 = the game's own water)
 reflection_strength = 1
+water_style = 0 # stylised sea: depth colour, shore foam, sun glints (needs reflections = 1); see "Stylised sea"
 specular = 1    # materials and traced reflections on glossy surfaces
 specular_strength = 1
 smooth = 1      # trace from the smooth surface the vertex normals describe (0 = flat triangles)
@@ -816,6 +817,32 @@ levels by up to 25%. Explosions (`film_exp2_off/on.png`, a fire jet frozen at 10
 `bloom_threshold = 1.0` and `bloom = 0.25` the jet gets a soft halo at its hot core and keeps its shape, no haze
 over the scene (judged with the earlier bloom 0.25 from 1.0; the chosen 0.15 from 1.2 is gentler); particles keep animating while paused, so the two shots are about 2 s apart. Not tested in play mode or at real 1080p
 without `scale = 0.5`.
+### Per-level colour script (`grade_levels`, `wumrt_grades.ini`)
+
+Each level can have its own hand-tuned grade on top of the global one (like a film's colour
+script): `grade_levels = 1` (default 0; needs `post = 1`) reads `wumrt_grades.ini` (copied to the
+sandbox by `build.sh`; `rt.py reload` reads it again). A level is a block:
+
+```
+[Apple Core Island]          # golden afternoon
+textures 1234abcd 5678ef01   # terrain textures that mark the level
+gain 1.06 1.0 0.9            # multiplies everything (the light's colour), per channel
+lift 0.002 0.001 0.0         # added in the shadows (linear, small)
+gamma 1.02 1.0 0.98          # midtones (above 1 brighter)
+saturation 1.05              # on top of the global saturation
+night 0                      # 1: keep it on night matches too (default: fades out with grade_auto's night)
+```
+
+How it works (`grade.c`, included from `post.c`): wumrt.c reports every landscape draw's
+texture hash (`rt_terrain_hash` in rt_core.c); the level whose listed textures were drawn most in
+the last 2 s wins, and its grade blends in over ~2 s (`grade_speed`, share per frame, default
+0.04). Unknown terrain blends back to no level grade; menus (no terrain) keep the last one. New
+terrain hashes go to the log as `grade: terrain HASH`, the chosen level as `grade: level NAME`, so
+adding a level is: `rt.py level NAME`, copy its `grade: terrain` lines into a new block, tune,
+`rt.py reload`. In the shader the level grade runs after the warm/cool split and before the
+vignette and shoulder: `c *= gain; c += lift * shadows; c = pow(c, 1/gamma); saturation`. Cost:
+a few ALU per pixel; the hash lookup is a few dozen compares per terrain draw.
+
 ## Rounded shapes
 
 `round.c` replaces every sun-lit mesh draw that is not terrain, not alpha-tested and not
@@ -998,6 +1025,35 @@ Cost (480x270, `fx_log = 1` logs it every 90 frames):
 
 Captures: `captures/fx_*` (explosion paused, fx off / on).
 
+## Lit smoke
+
+The game draws its smoke puffs as unlit, alpha-blended sprites (`FFVertexMainTexCol` /
+`FFFragmentMainTexCol`), so they keep the same cream colour by day and at night. With
+`smoke = 1` the patched `FFFragmentMainTexCol` shades them like soft volumes:
+
+- which draws: main-view, SA/1-SA blended draws of the unlit textured-colour programs whose
+  texture averages to a white or grey colour with a partly transparent alpha
+  (`fx_smoke_texture` in fx.c). Fire, flash and sparkle textures are coloured and stay unlit
+  (they glow, and fx.c turns them into lights). Every other draw of that program gets
+  `rtSmoke.x = 0` and is unchanged.
+- normal: from the puff's alpha slope (4 extra texture taps), so it bends outwards at the edge
+  and along the billows.
+- light: the sun's colour (as the game gives it to the terrain's shader) times a wrapped,
+  squared Lambert term towards the sun (direction in view space from the harness), plus the
+  game's ambient colour, darker on the underside.
+
+| setting | default | meaning |
+|---|---|---|
+| `smoke` | 0 | on/off |
+| `smoke_strength` | 1 | overall scale of the lit colour |
+| `smoke_step` | 1/32 | texture step of the alpha slope |
+| `smoke_gain` | 6 | alpha slope -> normal tilt (negative flips the texture's v) |
+| `smoke_under` | 0.55 | ambient the underside keeps |
+| `smoke_sun`, `smoke_ambient` | 1, 1 | scales of the sun and the ambient part |
+
+Limits: no shadow on the puff (it takes the sun as seen from the open sky), no light from
+explosions on the smoke yet, no traced shadow cast by the smoke.
+
 ## Atmospheric depth
 
 Distant surfaces fade towards the sky's own colour, more so low down (aerial perspective plus
@@ -1139,6 +1195,30 @@ the menu automation added only one team; the driver-compressed 2048 run reached 
 The flag is only set on a sandbox's exe copy (`texmem.py laa on`); `install.py` does not set
 it on the real game, and nothing here touches the real exe.
 
+## Stylised sea
+
+`water_style = 1` (0 = off, the default) turns the game's sea into animated-film water. It needs
+`reflections = 1`: the tracer already meets every camera ray with the sea plane, and now also
+stores in the reflection texture's alpha how far that ray runs under the water before it hits
+the terrain (`rtRefl.a = 1 + distance`, 8192 where it hits nothing; `wumrt_trace.comp`). The
+patched `water.cg` (`RtWaterStyle`, from `patch_shaders.py`) uses it for:
+
+- **depth colour**: turquoise in the shallows, a saturated mid blue, then deep blue
+  (1/e at 28 world units along the view ray; a worm is about 15 tall). The traced mirror image
+  still goes on top with the same Fresnel blend as before.
+- **shore foam**: a soft band of chunky blobs (two slow, coarse samples of the game's ripple map)
+  where the water is less than about 6 units deep straight down, with rings rolling in towards
+  the shore and a solid lip in the last unit. Nothing at all where the ray met no seabed.
+- **sun glints**: a tight sun highlight on the ripple normals, up to 6x the sun's brightness
+  so the film post's bloom picks it up (`hdr = 1`); none when the sun is low or the game paints
+  its sea dark.
+
+Everything is scaled by how bright the game itself paints its sea at that pixel, so night
+levels stay dark. The value of `water_style` (0..1) blends the body colour between the game's
+and the stylised one; foam and glints scale with it too. The engine sees the new uniform
+`rtWater` (= strength, direction towards the sun) hidden like the other rt uniforms; the C side
+is `water_style` in `wumrt.c` and `rt_water_sun()` in `rt_core.c`. Not done: caustics on the
+shallow seabed (would need the sea height in `Landscape.cg`).
 ## Cut-face edges (sculpted soil lips)
 
 Explosions cut the landscape into hard walls. The game draws those cut faces with the same

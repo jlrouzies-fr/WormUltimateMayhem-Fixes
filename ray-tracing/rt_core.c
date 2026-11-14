@@ -301,6 +301,7 @@ static struct {
     int gi; float gi_sky, gi_bounce, gi_tint;       /* traced sky light instead of constant ambient */
     float sun_col[3], amb_col[3]; u32 light_frame;  /* the game's light colours, and when they were last given */
     float water_y; u32 water_frame;                 /* the sea plane, and when it was last drawn */
+    float water_sun[3];                             /* towards the sun, for the sea's glints (water.cg) */
     GLint u_sun_col, u_sky_gain, u_fallback, u_gi, u_prev_vp, u_prev_eye, u_albedo, u_sky_atlas, u_sky_tint;
     GLint u_gi_rate;
     GLint u_cloud; float cloud[3];                 /* moss: cloud shadows: strength, size, speed (rt_set_clouds) */
@@ -1010,6 +1011,14 @@ int rt_shell(u32 tex, float *out)
     if (m->shell_h <= 0) return 0;
     out[0] = m->shell_h; out[1] = m->shell_d;
     return 1;
+}
+
+/* grade (post.c / grade.c): a terrain texture's hash, to recognise the level. */
+u32 rt_terrain_hash(u32 tex)
+{
+    if (!tex || tex >= 65536) return 0;
+    if (!layer_of_tex[tex] && (!gl_init() || !layer_for_texture(tex))) return 0;
+    return mats[layer_of_tex[tex]].hash;
 }
 
 int rt_char_kind(u32 tex)
@@ -2626,6 +2635,7 @@ static int trace(struct cam *c)
     gl.Uniform3f(R.u_dx, (float)(px[0] - base[0]), (float)(px[1] - base[1]), (float)(px[2] - base[2]));
     gl.Uniform3f(R.u_dy, (float)(py[0] - base[0]), (float)(py[1] - base[1]), (float)(py[2] - base[2]));
     gl.Uniform3f(R.u_sun, (float)sun[0], (float)sun[1], (float)sun[2]);
+    for (k = 0; k < 3; k++) R.water_sun[k] = (float)sun[k];
     /* The sun's sample pattern changes every frame when the result is accumulated over time. */
     gl.Uniform4f(R.u_params, (float)R.samples, (float)tan(R.radius * 3.14159265358979 / 180.0),
                  R.accum > 0 && R.samples > 1 && R.filter_radius > 0 ? (float)(R.frame & 63) : 0.0f, 0.0f);
@@ -3099,6 +3109,11 @@ void rt_set_light(const float *sun_rgb, const float *ambient_rgb)
     memcpy(R.sun_col, sun_rgb, 12);
     memcpy(R.amb_col, ambient_rgb, 12);
     R.light_frame = R.frame;
+}
+
+void rt_water_sun(float *s)
+{
+    s[0] = R.water_sun[0]; s[1] = R.water_sun[1]; s[2] = R.water_sun[2];
 }
 
 void rt_set_water(float height)

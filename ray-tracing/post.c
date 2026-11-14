@@ -121,6 +121,8 @@ static struct {
     int timer;
 } S = { 0, 0, 0, 1, 1.0f, 1.0f, 0.6f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.5f, 5, 0.0f, 1.0f, 0.3f, 0.15f, 0 };
 
+#include "grade.c"      /* grade stream: per-level colour script (wumrt_grades.ini, grade_levels) */
+
 void post_settings_begin(void)
 {
     /* every read of wumrt.ini starts from the defaults, so a deleted line means "default" */
@@ -131,6 +133,7 @@ void post_settings_begin(void)
     S.glare = 0.0f; S.glare_size = 1.0f;
     S.auto_exposure = 0.0f; S.auto_key = 0.35f; S.grade_auto = 0;
     S.timer = 0;
+    gr_on = 0; gr_speed = 0.04f; gr_loaded = 0;     /* grade.c: wumrt_grades.ini is read again too */
 }
 
 int post_setting(const char *name, float v)
@@ -160,6 +163,8 @@ int post_setting(const char *name, float v)
     else if (!strcmp(name, "aa")) S.aa = v != 0;
     else if (!strcmp(name, "dither")) S.dither = v != 0;
     else if (!strcmp(name, "post_timer")) S.timer = v != 0;
+    else if (!strcmp(name, "grade_levels")) gr_on = v != 0;                    /* grade.c */
+    else if (!strcmp(name, "grade_speed")) gr_speed = v > 0 && v <= 1 ? v : 1;  /* grade.c */
     else return 0;
     return 1;
 }
@@ -647,6 +652,7 @@ static void run_post(void)
         common_uniforms(p, G.sw, G.sh, G.sw, G.sh);
         sun_uniforms(p);
         set4(p, "uGrade", mood_warm(), S.vignette, strength, S.dither ? 1.0f : 0.0f);
+        grade_uniforms(p, S.grade_auto ? F.night : 0.0f);                                  /* grade.c: the level's own grade */
         pg.BindImageTexture(0, G.ldr, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
         dispatch(G.sw, G.sh);
         pg.UseProgram(q);

@@ -139,6 +139,7 @@ struct prog {
     int shell_on;                    /* fragment program: rtShell was left non-zero */
     void *p_rt_relief;               /* lit fragment programs: the parallax relief uniform */
     void *p_rt_wind;                 /* terrain fragment programs: wind and colour patches on the grass */
+    void *p_rt_water;                /* the sea's fragment program: stylised water (water_style) and the sun */
     void *p_rt_blade;                /* terrain fragment programs: backlit blades (characters stream) */
     void *p_mvp, *p_mv, *p_campos;   /* the sea's vertex program: its combined matrices and camera position */
 };
@@ -162,6 +163,7 @@ static void *(__cdecl *p_cgGetNamedParameter)(void *, const char *);
    writes a log line for any it has no handler for, which is very slow; so it is not shown ours. */
 #define MAX_RT_PARAMS 1024
 static void *rt_param_handles[MAX_RT_PARAMS];
+static float water_style;   /* stylised sea in water.cg: depth colour, shore foam, sun glints (0 = off) */
 static int n_rt_param_handles;
 static void *(__cdecl *real_cgGetFirstParameter)(void *, int);
 static void *(__cdecl *real_cgGetNextParameter)(void *);
@@ -254,6 +256,7 @@ static void setup_program(struct prog *p, const struct cg_record *r)
             p->p_rt_char2 = p_cgGetNamedParameter(h, "rtChar2");
             p->p_rt_relief = p_cgGetNamedParameter(h, "rtRelief");
             p->p_rt_wind = p_cgGetNamedParameter(h, "rtWind");
+            p->p_rt_water = p_cgGetNamedParameter(h, "rtWater");
             p->p_rt_blade = p_cgGetNamedParameter(h, "rtBlade");
         }
         if (p_cgGetNamedParameter) {
@@ -265,13 +268,13 @@ static void setup_program(struct prog *p, const struct cg_record *r)
 /* Hide this program's extra uniforms from the engine's parameter walks. */
 static void add_rt_params(const struct prog *p)
 {
-    void *h[13];
+    void *h[14];
     int i;
     h[8] = p->p_rt_char; h[9] = p->p_rt_char2;
     h[0] = p->p_rt_normal; h[1] = p->p_rt_params3; h[2] = p->p_rt_refl; h[3] = p->p_rt_bounce;
     h[4] = p->p_rt_params2; h[5] = p->p_rt_params; h[6] = p->p_rt_mask; h[7] = p->p_rt_shell;
-    h[10] = p->p_rt_relief; h[11] = p->p_rt_wind; h[12] = p->p_rt_blade;
-    for (i = 0; i < 13; i++)
+    h[10] = p->p_rt_relief; h[11] = p->p_rt_wind; h[12] = p->p_rt_water; h[13] = p->p_rt_blade;
+    for (i = 0; i < 14; i++)
         if (h[i] && n_rt_param_handles < MAX_RT_PARAMS) rt_param_handles[n_rt_param_handles++] = h[i];
 }
 
@@ -1177,6 +1180,11 @@ static void before_draw(u32 kind, GLenum mode, u32 first, u32 count, GLenum ityp
             GLuint rtex = rt_water_reflection(info);
             if (rtex || fp->refl_last) {
                 real_cgGLSetParameter4f(fp->p_rt_params, rtex ? 1.0f : 0.0f, info[0], info[1], info[2]);
+                if (fp->p_rt_water) {
+                    float s[3];
+                    rt_water_sun(s);
+                    real_cgGLSetParameter4f(fp->p_rt_water, rtex ? water_style : 0.0f, s[0], s[1], s[2]);
+                }
                 if (rtex && p_glActiveTexture) {
                     GLint act = 0;
                     glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
@@ -1351,6 +1359,7 @@ static void draw_shells(u32 kind, GLenum mode, u32 first, u32 start, u32 end, u3
     int i, n = shell_count > 64 ? 64 : shell_count;
     LARGE_INTEGER t0, t1, freq;
     if (!vp || !fp || !vp->landscape || !vp->p_rt_shell || !fp->p_rt_shell) return;
+    if (post_wants_terrain()) post_note_terrain(rt_terrain_hash(fp->tex0));   /* grade.c: which level */
     if (n <= 0 || !rt_shell(fp->tex0, sh)) {
         if (fp->shell_on) {
             real_cgGLSetParameter4f(fp->p_rt_shell, 0, 0, 0, 0);
@@ -1799,6 +1808,7 @@ static void read_settings(void)
     float gi_far = 0.0f;
     float spec_strength = 1.0f, bump = 0.0f;
     int smooth = 1, shells = 0, ftimer = 0, hud = 0;
+    float wstyle = 0;
     float sh_height = 3.5f, sh_density = 0.3f, sh_width = 0.45f;
     int sh_shadow = 0;
     float gr_wind = 0, gr_patches = 0;
@@ -1859,6 +1869,7 @@ static void read_settings(void)
         else if (!strcmp(name, "grass_patches")) gr_patches = v;
         else if (!strcmp(name, "frame_timer")) ftimer = v != 0;
         else if (!strcmp(name, "hide_hud")) hud = (int)v;
+        else if (!strcmp(name, "water_style")) wstyle = v;
         else if (!strcmp(name, "scatter")) scatter = v != 0;
         else if (!strcmp(name, "scatter_density")) sc_density = v;
         else if (!strcmp(name, "scatter_size")) sc_size = v;
@@ -1908,6 +1919,7 @@ static void read_settings(void)
     frame_timer_on = ftimer;
     if (hud != hide_hud) hud_logged = 0;
     hide_hud = hud;
+    water_style = wstyle;
     scatter_on = scatter;
     relief_depth = rl_depth;
     relief_shadow = rl_shadow;

@@ -30,5 +30,5 @@ elif cp build/glut32.dll "$SB/glut32.dll" 2>/dev/null; then
 else
   echo "loader changed but glut32.dll is in use: stop the game (python sandbox.py stop) and build again"
 fi
-cp wumrt_trace.comp wumrt_filter.comp wumrt_temporal.comp wumrt_atrous.comp wumrt_fx.comp wumrt_post.comp wumrt_atmos.comp wumrt_materials.ini wumrt_surfaces.ini wumrt_characters.ini "$SB/"
+cp wumrt_trace.comp wumrt_filter.comp wumrt_temporal.comp wumrt_atrous.comp wumrt_fx.comp wumrt_post.comp wumrt_atmos.comp wumrt_materials.ini wumrt_surfaces.ini wumrt_characters.ini wumrt_grades.ini "$SB/"
 echo built

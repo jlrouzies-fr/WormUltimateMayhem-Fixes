@@ -610,6 +610,77 @@ for name, tex in (("void FFFragmentMainLit(", "float3( 0.5f, 0.5f, 0.5f )"),
          "\t\t\tinLightVector, lightDiffuseCol, lightAmbientCol, rtSun, " + tex + ", baseCol, additiveCol );\n" + s[at:])
 p.write_text(s, encoding="latin1", newline="")
 
+# ---- FixedFunction.cg: smoke puffs lit like soft volumes (wumrt.c sets rtSmoke for smoke only) ----
+# rtSmoke = (on, strength, texture step for the alpha slope, slope gain; negative flips v).
+# rtSmokeSun = (direction towards the sun in view space, x right, y up, z towards the eye; visibility).
+# rtSmokeSunCol = sun colour; rtSmokeAmb = (ambient colour, how much the underside keeps).
+# rtSmokeFx = (brightest effect light in view space, its radius), rtSmokeFxCol = (its power, z sign).
+# The puff's alpha slope gives a normal that bends out at its edges and along its billows, so
+# the sunny side is bright, the far side falls off softly and the underside is darker.
+p = cg / "FixedFunction.cg"
+s = p.read_text(encoding="latin1")
+rep("""	FFVertexMainTex(	inPos, inTexCoord0,
+						outPos, outTexCoord0,
+						model, view, projection, texTransform );
+	outColour = inColour;
+}""", """	FFVertexMainTex(	inPos, inTexCoord0,
+						outPos, outTexCoord0,
+						model, view, projection, texTransform );
+	outColour = inColour;
+	outVPos = mul( mul( float4( inPos, 1 ), model ), view ).xyz;
+}""")
+rep("""							out float4 outColour : COLOR,
+							uniform float4x4 model,
+							uniform float4x4 view,
+							uniform float4x4 projection,
+							uniform float4x4 texTransform )
+{
+	FFVertexMainTex(""", """							out float4 outColour : COLOR,
+							out float3 outVPos : TEXCOORD1,
+							uniform float4x4 model,
+							uniform float4x4 view,
+							uniform float4x4 projection,
+							uniform float4x4 texTransform )
+{
+	FFVertexMainTex(""")
+rep("""void FFFragmentMainTexCol(	float2 inTexCoord0 : TEXCOORD0,
+							float4 inCol : COLOR,
+							uniform sampler2D texture0,
+							out float4 outCol : COLOR )
+{
+	outCol = tex2D( texture0, inTexCoord0 ) * inCol;
+}""", """void FFFragmentMainTexCol(	float2 inTexCoord0 : TEXCOORD0,
+							float4 inCol : COLOR,
+							float3 inVPos : TEXCOORD1,
+							uniform sampler2D texture0,
+							uniform float4 rtSmoke,
+							uniform float4 rtSmokeSun,
+							uniform float4 rtSmokeSunCol,
+							uniform float4 rtSmokeAmb,
+							uniform float4 rtSmokeFx,
+							uniform float4 rtSmokeFxCol,
+							out float4 outCol : COLOR )
+{
+	outCol = tex2D( texture0, inTexCoord0 ) * inCol;
+	if ( rtSmoke.x > 0.5f )
+	{
+		float d = rtSmoke.z;
+		float ax = tex2D( texture0, inTexCoord0 + float2( d, 0 ) ).a - tex2D( texture0, inTexCoord0 - float2( d, 0 ) ).a;
+		float ay = tex2D( texture0, inTexCoord0 + float2( 0, d ) ).a - tex2D( texture0, inTexCoord0 - float2( 0, d ) ).a;
+		float3 n = normalize( float3( -ax * abs( rtSmoke.w ), -ay * rtSmoke.w, 1.0f ) );
+		float wrap = saturate( ( dot( n, rtSmokeSun.xyz ) + 0.5f ) / 1.5f );
+		float up = saturate( n.y * 0.7f + 0.5f );
+		float3 light = rtSmokeAmb.rgb * lerp( rtSmokeAmb.w, 1.0f, up ) + rtSmokeSunCol.rgb * ( wrap * wrap * rtSmokeSun.w );
+		float3 tl = rtSmokeFx.xyz - inVPos;
+		float d2 = dot( tl, tl );
+		tl.z *= rtSmokeFxCol.w;
+		float fw = saturate( ( dot( n, tl * rsqrt( d2 + 1e-4f ) ) + 0.7f ) / 1.7f );
+		light += rtSmokeFxCol.rgb * ( fw / ( d2 + rtSmokeFx.w * rtSmokeFx.w ) );
+		outCol.rgb *= light * rtSmoke.y;
+	}
+}""")
+p.write_text(s, encoding="latin1", newline="")
+
 # ---- Landscape.cg: terrain ----
 p = cg / "Landscape.cg"
 s = p.read_text(encoding="latin1")
@@ -681,6 +752,55 @@ rep("\tfloat4 texCol = tex2D( texture0, inTexCoord0.xy );\n    outCol = float4( 
     "    outCol = float4( saturate( baseCol * texCol.rgb + additiveCol ), texCol.a ) * inVertexColour;")
 p.write_text(s, encoding="latin1", newline="")
 
+# Stylised sea (water_style > 0): rtRefl.a = 1 + how far the camera ray runs under the water
+# to the seabed (wumrt_trace.comp), so shallow water turns turquoise and deep water a saturated
+# blue, a soft chunky foam band rolls in where the water is shallow (shores, around rocks), and
+# the sun leaves bright glints on the ripples for the film post's bloom. The game's own water
+# brightness scales it all, so night levels stay dark. Fixed-size loops only.
+WATER_STYLE = r"""// wumrt: stylised sea (water_style)
+float4 RtWaterStyle( float4 rtWater, float4 rtR, float4 rtR0, float fres, float3 game, float3 nm,
+                     float3 eye, float2 uv, float time, sampler2D nmap )
+{
+	// Depth along the view ray (steady lookup; the ripple-shifted one if that missed the sea)
+	float d = ( rtR0.a > 0.5f ? rtR0.a : rtR.a ) - 1;
+	float h = d * abs( eye.y );                          // depth straight down
+	float k = rtWater.x;
+	// How bright the game paints its sea here (dark at night, bright by day)
+	float lum = dot( game, float3( 0.2126f, 0.7152f, 0.0722f ) );
+	float bright = clamp( lum / 0.32f, 0.15f, 1.6f );
+	float deep = 1 - exp( -d / 55.0f );
+	float3 shallowC = float3( 0.22f, 0.86f, 0.80f );
+	float3 midC = float3( 0.05f, 0.52f, 0.72f );
+	float3 deepC = float3( 0.03f, 0.25f, 0.60f );
+	float3 body = lerp( lerp( shallowC, midC, saturate( deep * 2 ) ), deepC, saturate( deep * 2 - 1 ) );
+	// Ripples shade the body a little (broad, not fine)
+	body *= 0.88f + 0.24f * saturate( nm.y * 0.5f + 0.5f );
+	body *= bright;
+	float3 c = lerp( lerp( game, body, saturate( k ) ), rtR.rgb, saturate( fres ) );
+	// Shore foam: chunky soft blobs from a slow, coarse sample of the ripple map, banded so that
+	// rings roll in towards the shore and fade out over about 6 units of depth.
+	float n1 = tex2D( nmap, uv * 0.11f + time * float2( 0.011f, 0.007f ) ).r;
+	float n2 = tex2D( nmap, uv * 0.23f - time * float2( 0.006f, 0.013f ) ).g;
+	float blob = n1 * 0.6f + n2 * 0.4f;
+	float band = 0.5f + 0.5f * sin( h * 1.1f - time * 1.6f + blob * 4.0f );
+	float near = saturate( 1 - h / 14.0f );
+	float lip = saturate( 1 - h / 2.5f );                // solid rim right at the shore
+	float f = saturate( near * ( band * 0.7f + 0.25f ) + lip * 0.8f - 0.75f + blob * 0.6f );
+	f = smoothstep( 0.25f, 0.45f, f ) * ( d < 8000.0f ? 1.0f : 0.0f );
+	float3 foamC = float3( 0.93f, 0.98f, 1.0f ) * max( bright, 0.25f );
+	f *= saturate( k );
+	c = lerp( c, foamC, f );
+	// Sun glints on the ripples: a tight highlight of the sun, strong enough for bloom
+	float3 n = normalize( float3( nm.x * 0.55f, 1.0f, nm.y * 0.55f ) );
+	float3 hv = normalize( rtWater.yzw - eye );
+	float g = pow( saturate( dot( n, hv ) ), 900.0f );
+	float day = saturate( rtWater.z * 4.0f ) * saturate( lum * 3.0f );
+	c += float3( 1.0f, 0.95f, 0.82f ) * g * 6.0f * k * day * ( 1 - f );
+	// a: foam is opaque; the clear shallows stay see-through as the game draws them
+	return float4( c, f );
+}
+
+"""
 # ---- edges (stream "edges"): sculpted soil where the terrain turns over -------------------
 # Explosions cut the landscape into hard walls. Where the ground turns from up-facing into a
 # wall over a tight convex bend (the cut's lip), the soil gets a soft, light bevel band that
@@ -750,11 +870,11 @@ if p.exists():
     s = p.read_text(encoding="latin1")
     rep("\t\t\t\t\t\tuniform float4x4 combinedWaterParams,\n",
         "\t\t\t\t\t\tuniform float4x4 combinedWaterParams,\n"
-        "\t\t\t\t\t\tfloat4 inWPos : WPOS,\n\t\t\t\t\t\tuniform sampler2D rtRefl,\n\t\t\t\t\t\tuniform float4 rtParams,\n")
+        "\t\t\t\t\t\tfloat4 inWPos : WPOS,\n\t\t\t\t\t\tuniform sampler2D rtRefl,\n\t\t\t\t\t\tuniform float4 rtParams,\n\t\t\t\t\t\tuniform float4 rtWater,\n")
     rep("\toutCol = float4( vDiffuse + vSphericalDiffuse + vSphericalSpecular, nearOpacity );",
         "\t// rtRefl: what the traced mirror ray saw at this pixel (a = 1 where the sea was visible).\n"
         "\t// rtParams = (enabled, 1/width, 1/height of the view, strength). The ripples shift the lookup.\n"
-        "\tfloat3 rtCol = vDiffuse + vSphericalDiffuse;\n"
+        "\tfloat3 rtCol = vDiffuse + vSphericalDiffuse;\n\tfloat rtA = nearOpacity;\n"
         "\tif ( rtParams.x > 0.5f )\n\t{\n"
         "\t\tfloat2 rtUv = inWPos.xy * rtParams.yz;\n"
         "\t\tfloat4 rtR = tex2D( rtRefl, rtUv + vCombinedNormalMap.xy * 0.02f );\n"
@@ -764,8 +884,14 @@ if p.exists():
         "\t\t\tfloat rtF = 1 - saturate( dot( -inEyeVec, inNormal ) );\n"
         "\t\t\trtF = 0.06f + 0.94f * rtF * rtF * rtF * rtF * rtF;\n"
         "\t\t\trtCol = lerp( vDiffuse, rtR.rgb, saturate( rtF * rtParams.w ) );\n"
+        "\t\t\tif ( rtWater.x > 0 )\n\t\t\t{\n"
+        "\t\t\t\tfloat4 rtWS = RtWaterStyle( rtWater, rtR, tex2D( rtRefl, rtUv ), rtF * rtParams.w, vDiffuse + vSphericalDiffuse,\n"
+        "\t\t\t\t                      vCombinedNormalMap, inEyeVec, inTexCoord0.xy, pausedTime, texture1 );\n"
+        "\t\t\t\trtCol = rtWS.rgb;\n\t\t\t\trtA = lerp( nearOpacity, 1.0f, rtWS.a );\n\t\t\t}\n"
         "\t\t}\n\t}\n"
-        "\toutCol = float4( rtCol + vSphericalSpecular, nearOpacity );")
+        "\toutCol = float4( rtCol + vSphericalSpecular, rtA );")
+    # Stylised animated-film sea (water_style in wumrt.ini; rtWater = (strength, towards the sun)).
+    s = s.replace("void WaterFragmentMain(", WATER_STYLE + "void WaterFragmentMain(", 1)
     p.write_text(s, encoding="latin1", newline="")
 
 # ---- HDR for the film post-processing (post.c, hdr = 1 in wumrt.ini) ----

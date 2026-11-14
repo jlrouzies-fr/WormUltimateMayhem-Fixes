@@ -42,6 +42,8 @@ struct fx_view {
 void fx_trace(const struct fx_view *v);
 
 void fx_texture_gone(GLuint id);
+int fx_smoke_texture(GLuint tex);
+int fx_smoke_light(float *pos_r, float *rgb);  /* brightest effect light: world pos + radius, power */    /* a soft white/grey sprite texture (lit smoke, wumrt.c) */
 void fx_forget(void);           /* new GL context: our GL objects are gone */
 void fx_shutdown(void);         /* core unload: delete our GL objects (programs: see fx_program) */
 GLuint fx_program(int i);       /* our compute programs (0, 1), for rt_shutdown to keep or delete */

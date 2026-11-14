@@ -24,6 +24,11 @@ void post_reload(void);                         /* rt.py reload: compile wumrt_p
    centre of every worm draw (world space) with the camera it is drawn with. */
 int post_wants_worms(void);
 void post_note_worm(const float *centre, const float *view, const float *proj);
+/* grade.c: wumrt.c reports every landscape draw's texture hash (rt_terrain_hash) so the level
+   is recognised for its own grade (wumrt_grades.ini). */
+int post_wants_terrain(void);
+void post_note_terrain(u32 hash);
+u32 rt_terrain_hash(u32 tex);   /* rt_core.c: a terrain texture's hash, 0 if unknown */
 
 /* rt_core.c: the main view's traced mask this frame (eye distance in .y), its size and the
    size of the view it was traced for; 0 if there is none. */

@@ -147,6 +147,23 @@ static const float *tex_colour(GLuint tex)
     return tcol[ntcol++].rgb;
 }
 
+/* Smoke for the lit smoke (wumrt.c smoke_draw): a soft white or grey sprite texture, i.e. a
+   low-saturation, fairly bright average colour and a partly transparent average alpha. Fire,
+   flash and sparkle textures are coloured, so they stay unlit (they glow). */
+int fx_smoke_texture(GLuint tex)
+{
+    const float *c;
+    float mx, mn, a = 1;
+    u32 k;
+    if (!tex) return 0;
+    c = tex_colour(tex);
+    for (k = 0; k < ntcol && tcol[k].tex != tex; k++) ;
+    if (k < ntcol) a = tcol[k].a;
+    mx = c[0] > c[1] ? (c[0] > c[2] ? c[0] : c[2]) : (c[1] > c[2] ? c[1] : c[2]);
+    mn = c[0] < c[1] ? (c[0] < c[2] ? c[0] : c[2]) : (c[1] < c[2] ? c[1] : c[2]);
+    return mx > 0.45f && mx - mn < 0.12f && a > 0.15f && a < 0.85f;
+}
+
 void fx_texture_gone(GLuint id)
 {
     u32 i;
@@ -837,4 +854,19 @@ void fx_shutdown(void)
     if (X.buf) G.DeleteBuffers(1, &X.buf);
     memset(X.cam, 0, sizeof X.cam);
     X.buf = 0;
+}
+
+/* The brightest effect light now (world position, radius; rgb power as the tracer gets it). */
+int fx_smoke_light(float *pos_r, float *rgb)
+{
+    u32 i, best = 0;
+    float bl = -1;
+    if (!S.on || !n_glights) return 0;
+    for (i = 0; i < n_glights; i++) {
+        float l = glights[i].col[0] + glights[i].col[1] + glights[i].col[2];
+        if (l > bl) { bl = l; best = i; }
+    }
+    if (bl <= 0) return 0;
+    memcpy(pos_r, glights[best].pr, 16); memcpy(rgb, glights[best].col, 12);
+    return 1;
 }

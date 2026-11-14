@@ -37,6 +37,9 @@ uniform vec4 uFrame;       // focus smoothing per frame, frame number, what PASS
 uniform vec4 uSun;        // the sun on screen (0..1), 1 if in front of the camera, glare strength
 uniform vec4 uSunCol;     // the sun's colour (linear), glare size
 uniform vec4 uAuto;       // auto exposure strength (0 = off), the scene key it aims at (linear), adaptation per frame, -
+uniform vec4 uLift;       // per-level grade (grade.c, wumrt_grades.ini): lift rgb (shadows), 1 = on
+uniform vec4 uGamma;      // per-level grade: gamma rgb (midtones), -
+uniform vec4 uGain;       // per-level grade: gain rgb, saturation
 
 const float FAR = 60000.0;
 
@@ -313,6 +316,14 @@ void main()
         float t = smoothstep(0.02, 0.6, y);
         vec3 tint = mix(vec3(0.88, 0.95, 1.12), vec3(0.96, 0.99, 1.04), t);
         c *= mix(vec3(1.0), tint, -uGrade.x);
+    }
+    // the level's own grade (grade.c): gain, lift in the shadows, gamma, saturation
+    if (uLift.w > 0.0) {
+        c *= uGain.rgb;
+        c += uLift.rgb * (1.0 - smoothstep(0.0, 0.4, luma(c)));
+        c = pow(max(c, vec3(0.0)), 1.0 / max(uGamma.rgb, vec3(0.2)));
+        float yl = luma(c);
+        c = max(yl + (c - yl) * uGain.w, vec3(0.0));
     }
     // vignette
     if (uGrade.y > 0.0) {
