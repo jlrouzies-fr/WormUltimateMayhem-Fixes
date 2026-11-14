@@ -58,11 +58,17 @@ def ctl_name(sandbox):
     (a parallel work stream); the loader derives the same from the exe's path."""
     import re
     p = Path(sandbox).resolve()
-    if p.name.lower() == "rt-sandbox" and p.parent.parent.name.lower() == "streams" and p.parent.name:
+    if p.name.lower() != "rt-sandbox":
+        return "wumrt_ctl_play"         # rt-play (make_play.py) or an installed game
+    if p.parent.parent.name.lower() == "streams" and p.parent.name:
         return "wumrt_ctl_" + re.sub(r"[^A-Za-z0-9_-]", "_", p.parent.name[:60])
     return "wumrt_ctl"
 
 
+# WUMRT_PLAY=1: talk to the user's playable copy WormsXHD/rt-play instead (read-only checks such as
+# status and rtstat only: the user is playing it)
+if __import__("os").environ.get("WUMRT_PLAY") == "1":
+    SANDBOX = SANDBOX.parent / "rt-play"
 CTL_NAME = ctl_name(SANDBOX)
 LOG = SANDBOX / "wumrt.log"
 

@@ -235,9 +235,15 @@ sound), at the resolution of the real game's `local.cfg` in full screen with the
 sandbox's set). The real game folder is only read. Start `rt-play/WormsMayhem.exe` with Steam
 running; F9 switches the tracing off and on. Run it again after merges for the newest look (it
 refuses while rt-play's game runs and rewrites rt-play's `wumrt.ini`; change `PLAY_SETTINGS` in
-the script instead). `sandbox.py` refuses to start any sandbox while rt-play's game runs, and
-main's `rt.py` talks to rt-play's game (same control block `wumrt_ctl`), so `rt.py rtstat` reads
-its cost. Untested so far: play mode, full screen, 4K and the film effects above 1080p.
+the script instead). `sandbox.py` refuses to start any sandbox while rt-play's game runs. A game
+outside an `rt-sandbox` folder uses its own control block `wumrt_ctl_play`, so no sandbox command
+reaches it; `WUMRT_PLAY=1 py -3 rt.py status|rtstat` reads it (read-only checks only: the user is
+playing). In play mode the loader makes the game DPI aware (`SetProcessDPIAware`, like the real
+game's HIGHDPIAWARE compatibility flag; without it a 4K game at 200% scaling did not fit the
+screen). Known: the first frame of every match stalls 8-12 s while the compute shaders compile
+(Windows may call the game "not responding"; wait). First play run (21:25) also hit a broken
+FixedFunction.cg (two edits declared `inWPos` twice: every program in the file failed, so no
+objects or menu scene); fixed in `patch_shaders.py`, which now refuses duplicate parameters.
 
 ## Live editing (no restarts)
 

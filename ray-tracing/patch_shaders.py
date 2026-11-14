@@ -1033,11 +1033,11 @@ rep("void FFFragmentMainTex(\tfloat2 inTexCoord0 : TEXCOORD0,\n"
     "\t\toutCol.rgb = RtSky( outCol.rgb, tex2Dbias( texture0, float4( inTexCoord0, 0, 2.5f ) ).rgb, inWPos, rtSky,\n"
     "\t\t\t\t\t\t\trtSkyR, rtSkyU, rtSkyF, rtSkySun, rtSkySunCol );\n"
     "}\n")
-# the sky's meshes are drawn with the vertex-coloured variant (also the smoke stream's lit smoke, above)
+# the sky's meshes are drawn with the vertex-coloured variant (also the smoke stream's lit smoke, above,
+# which already gives it inWPos: declaring it twice breaks every program in FixedFunction.cg)
 rep("\t\t\t\t\t\t\tuniform float4 rtSmokeFxCol,\n"
     "\t\t\t\t\t\t\tout float4 outCol : COLOR )\n",
     "\t\t\t\t\t\t\tuniform float4 rtSmokeFxCol,\n"
-    "\t\t\t\t\t\t\tfloat4 inWPos : WPOS,\n"
     "\t\t\t\t\t\t\tuniform float4 rtSky,\n"
     "\t\t\t\t\t\t\tuniform float4 rtSkyR,\n"
     "\t\t\t\t\t\t\tuniform float4 rtSkyU,\n"
@@ -1068,4 +1068,16 @@ for name in ("FixedFunction.cg", "Landscape.cg"):
     s = s.replace("outCol = float4( saturate(", "outCol = float4( RtHdr(")
     s = HDR_FN + s
     p.write_text(s, encoding="latin1", newline="")
+
+# ---- guard: a parameter declared twice in one function (two edits both adding it) is a compile
+# error for the WHOLE file, so the game loses every program in it (18:56: all 32 FixedFunction.cg
+# programs -> no objects, worms or menu scene). Fail here instead of in the game.
+import re
+for p in sorted(cg.glob("*.cg")):
+    text = p.read_text(encoding="latin1")
+    for m in re.finditer(r"\n(?:void|float[234]?|half[234]?)\s+(\w+)\s*\(([^)]*)\)", text):
+        names = [x.group(1) for x in (re.search(r"(\w+)\s*(?::\s*\w+)?\s*$", a.strip())
+                                       for a in m.group(2).split(",") if a.strip()) if x]
+        dup = sorted({n for n in names if names.count(n) > 1})
+        assert not dup, f"{p.name}: {m.group(1)}() declares {', '.join(dup)} more than once"
 print("shader edits ok")

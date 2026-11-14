@@ -1082,7 +1082,9 @@ static void hide_window_hooks(HMODULE glut)
 }
 
 /* The control block's name: "wumrt_ctl" for WormsXHD/rt-sandbox, "wumrt_ctl_NAME" when the exe
- * runs from WormsXHD/streams/NAME/rt-sandbox (a parallel work stream; rt.py derives the same). */
+ * runs from WormsXHD/streams/NAME/rt-sandbox (a parallel work stream; rt.py derives the same),
+ * "wumrt_ctl_play" from any other folder (rt-play, the user's playable copy, or an installed game),
+ * so a sandbox's scripted keys and camera moves can never reach the game the user is playing. */
 static char ctl_name[96] = CTL_NAME;
 
 static void derive_ctl_name(void)
@@ -1093,6 +1095,10 @@ static void derive_ctl_name(void)
     if (!GetModuleFileNameA(NULL, path, sizeof path)) return;
     for (p = path + strlen(path); p > path && n < 4; p--)    /* exe, sandbox folder, NAME, "streams" */
         if (*p == '\\' || *p == '/') { *p = 0; part[n++] = p + 1; }
+    if (n >= 2 && _stricmp(part[1], "rt-sandbox")) {
+        snprintf(ctl_name, sizeof ctl_name, "%s_play", CTL_NAME);
+        return;
+    }
     if (n < 4 || _stricmp(part[1], "rt-sandbox") || _stricmp(part[3], "streams") || !*part[2]) return;
     snprintf(ctl_name, sizeof ctl_name, "%s_%.60s", CTL_NAME, part[2]);
     for (i = (int)strlen(CTL_NAME) + 1; ctl_name[i]; i++) {
@@ -1176,7 +1182,11 @@ static void install(void)
 
     sandbox_mode = L.sandbox_mode = read_sandbox_setting();
     if (!sandbox_mode) {            /* normal play: the game keeps its own input and window handling */
-        logmsg("loader: hooks installed (play mode)");
+        /* Like the compatibility flag the real game's exe has (HIGHDPIAWARE): without it Windows
+           scales the game's window by the display's scaling (200% on a 4K screen), so a
+           3840x2160 game no longer fits the screen. Runs before the game makes its window. */
+        SetProcessDPIAware();
+        logmsg("loader: hooks installed (play mode, DPI aware)");
         return;
     }
     hide_window_hooks(glut);
