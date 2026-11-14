@@ -94,6 +94,7 @@ real game exists but has not been tried on one.
 | `wumrt_trace.comp`, `wumrt_temporal.comp`, `wumrt_filter.comp`, `wumrt_atrous.comp` | Tracer, accumulation over time, and the spatial filters (GLSL) |
 | `patch_shaders.py` | Edits copies of the game's Cg shaders (objects, terrain, water) to use the traced textures |
 | `install.py` | Installs or removes the mod in a game folder, keeping the originals |
+| `make_play.py` | Makes or refreshes `WormsXHD/rt-play`, a playable copy of the main sandbox (see "Play copy") |
 | `sandbox.py`, `rt.py`, `go.sh` | Run the sandbox game in the background and drive it (including the live reloads, the free camera and changing level) |
 | `mcp_server.py` | MCP server (stdio, no dependencies) offering the `rt.py` commands as tools, screenshots as images |
 | `stream.sh` | Parallel work streams: own copy, merge base and sandbox per stream; new, sync, merge (with `merge.lock`), unlock, list, delete |
@@ -222,6 +223,21 @@ Outside sandbox mode, F9 switches the tracing on and off for comparison.
 To try it in the real game (untested there): `sh build.sh`, close the game, then
 `python install.py install --game <game folder>`. `python install.py uninstall --game <game folder>`
 puts everything back.
+
+### Play copy
+
+`py -3 make_play.py [SCALE]` (from main's ray-tracing folder) makes or refreshes `WormsXHD/rt-play`:
+the main sandbox as it is now (exe with the large-address flag, loader, core, compute shaders,
+patched `CG/`, ini files) in play mode (`sandbox = 0`: the game keeps its own window, input and
+sound), at the resolution of the real game's `local.cfg` in full screen with the game's SSAA off
+(the mod has its own AA), and the tracer at SCALE of that resolution (default 0.25: 960x540 at
+4K). `Data`, `EFMV`, `speech` and `wumrt_textures` are junctions (the textures to the main
+sandbox's set). The real game folder is only read. Start `rt-play/WormsMayhem.exe` with Steam
+running; F9 switches the tracing off and on. Run it again after merges for the newest look (it
+refuses while rt-play's game runs and rewrites rt-play's `wumrt.ini`; change `PLAY_SETTINGS` in
+the script instead). `sandbox.py` refuses to start any sandbox while rt-play's game runs, and
+main's `rt.py` talks to rt-play's game (same control block `wumrt_ctl`), so `rt.py rtstat` reads
+its cost. Untested so far: play mode, full screen, 4K and the film effects above 1080p.
 
 ## Live editing (no restarts)
 

@@ -361,6 +361,9 @@ def launch(extra):
     games = [Path(g) for g in any_game_running()]
     if any(g.resolve() == REAL_GAME.resolve() for g in games if g.exists()):
         sys.exit(f"the real game ({REAL_GAME}) is running; sandboxes never start beside it")
+    if any(g.resolve().parent.name.lower() == "rt-play" for g in games if g.exists()):
+        # user 21:10: rt-play is the playable copy (make_play.py); it is the user's game now
+        sys.exit("the user is playing rt-play (the playable copy); sandboxes never start beside it")
     if len(games) >= MAX_GAMES:
         print(f"BUSY: {len(games)} sandbox games already run (at most {MAX_GAMES} at once): "
               + ", ".join(str(g.parent) for g in games) + ". Try again later.", file=sys.stderr)
